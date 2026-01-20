@@ -9,7 +9,7 @@ logging:
 # Chain network configuration
 chain:
   #displayName: "Ephemery Iteration xy"
-  tokenSymbol: SYM
+  tokenSymbol: LYX
 
 # HTTP Server configuration
 server:
