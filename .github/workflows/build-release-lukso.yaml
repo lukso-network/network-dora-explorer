@@ -20,4 +20,4 @@ jobs:
       container: true
       container_repository: "europe-docker.pkg.dev/lks-lz-artifacts/docker-network-dora-explorer/dora"
       container_tag_prefix: "dora"
-      additional_tags: "['latest']"
+      additional_tags: "latest"
