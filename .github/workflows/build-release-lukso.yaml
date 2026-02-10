@@ -1,0 +1,23 @@
+
+name: Build Release
+
+on:
+  push:
+    branches:
+      - 'master'
+      
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build_binaries:
+    name: "Build Dora"
+    uses: ./.github/workflows/_shared-build-lukso.yaml
+    with:
+      ref: ${{ github.sha }}
+      release: ${{ github.ref_name }}
+      container: true
+      container_repository: "europe-docker.pkg.dev/lks-lz-artifacts/docker-network-dora-explorer/dora"
+      container_tag_prefix: "dora"
+      additional_tags: "['latest']"
