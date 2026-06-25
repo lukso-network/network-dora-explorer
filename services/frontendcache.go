@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethpandaops/dora/cache"
@@ -24,6 +25,10 @@ type FrontendCacheService struct {
 	tieredCache          *cache.TieredCache
 	processingMutex      sync.Mutex
 	processingDict       map[string]*FrontendCacheProcessingPage
+	concurrencySem       chan struct{}
+	pageTypeSemMutex     sync.Mutex
+	pageTypeSemaphores   map[string]chan struct{}
+	pageTypeSemLimit     int
 	callStackMutex       sync.RWMutex
 	callStackBuffer      []byte
 }
@@ -57,23 +62,52 @@ func (e FrontendCachePageError) Stack() string {
 	return e.stack
 }
 
+// ErrTooManyPageRequests is returned when the concurrency limit is reached.
+var ErrTooManyPageRequests = fmt.Errorf("too many concurrent page requests")
+
 // StartFrontendCache is used to start the global frontend cache service
-func StartFrontendCache() error {
+func StartFrontendCache(logger logrus.FieldLogger) error {
 	if GlobalFrontendCache != nil {
 		return nil
 	}
 
 	cachePrefix := fmt.Sprintf("%sgui-", utils.Config.BeaconApi.RedisCachePrefix)
-	tieredCache, err := cache.NewTieredCache(utils.Config.BeaconApi.LocalCacheSize, utils.Config.BeaconApi.RedisCacheAddr, cachePrefix)
+	tieredCache, err := cache.NewTieredCache(utils.Config.BeaconApi.LocalCacheSize, utils.Config.BeaconApi.RedisCacheAddr, cachePrefix, logger)
 	if err != nil {
 		return err
 	}
 
+	// Resolve global concurrency limit: nil → default 50, explicit 0 → no limit
+	maxConcurrentPages := 50
+	if utils.Config.Frontend.MaxConcurrentPages != nil {
+		maxConcurrentPages = *utils.Config.Frontend.MaxConcurrentPages
+	}
+
+	var concurrencySem chan struct{}
+	if maxConcurrentPages > 0 {
+		concurrencySem = make(chan struct{}, maxConcurrentPages)
+	}
+
+	// Resolve per-page-type concurrency limit: nil → derive from global, explicit 0 → no limit
+	var pageTypeSemLimit int
+	if utils.Config.Frontend.MaxConcurrentPageType != nil {
+		pageTypeSemLimit = *utils.Config.Frontend.MaxConcurrentPageType
+	} else if maxConcurrentPages > 0 {
+		// Default to 1/5 of global limit, minimum 5
+		pageTypeSemLimit = maxConcurrentPages / 5
+		if pageTypeSemLimit < 5 {
+			pageTypeSemLimit = 5
+		}
+	}
+
 	GlobalFrontendCache = &FrontendCacheService{
-		tieredCache:     tieredCache,
-		processingDict:  make(map[string]*FrontendCacheProcessingPage),
-		callStackBuffer: make([]byte, 1024*1024*5),
-		cachingEnabled:  !utils.Config.Frontend.DisablePageCache && !utils.Config.Frontend.Debug,
+		tieredCache:        tieredCache,
+		processingDict:     make(map[string]*FrontendCacheProcessingPage),
+		callStackBuffer:    make([]byte, 1024*1024*5),
+		cachingEnabled:     !utils.Config.Frontend.DisablePageCache && !utils.Config.Frontend.Debug,
+		concurrencySem:     concurrencySem,
+		pageTypeSemLimit:   pageTypeSemLimit,
+		pageTypeSemaphores: make(map[string]chan struct{}, 16),
 	}
 	return nil
 }
@@ -109,9 +143,8 @@ func (fc *FrontendCacheService) ProcessCachedPage(pageKey string, caching bool, 
 
 func (fc *FrontendCacheService) processPageCall(pageKey string, caching bool, pageData interface{}, buildFn PageDataHandlerFn, pageCall *FrontendCacheProcessingPage) (interface{}, error) {
 	// process page call with timeout
-	returnChan := make(chan interface{})
-	errorChan := make(chan error)
-	isTimedOut := false
+	returnChan := make(chan any, 1)
+	errorChan := make(chan error, 1)
 
 	callCtx, callCtxCancel := context.WithCancel(context.Background())
 	defer callCtxCancel()
@@ -122,25 +155,64 @@ func (fc *FrontendCacheService) processPageCall(pageKey string, caching bool, pa
 	callIdx := fc.pageCallCounter
 	fc.pageCallCounterMutex.Unlock()
 
-	callGoId := uint64(0)
+	var callGoId atomic.Uint64
 
 	go func(callIdx uint64) {
 		defer func() {
 			if err := recover(); err != nil {
-				errorChan <- &FrontendCachePageError{
+				select {
+				case errorChan <- &FrontendCachePageError{
 					name:  "page panic",
 					err:   fmt.Errorf("page call %v panic: %v", callIdx, err),
 					stack: string(debug.Stack()),
+				}:
+				default:
 				}
 			}
 		}()
 
-		callGoId = routine.Goid()
+		callGoId.Store(routine.Goid())
+
+		// acquire global concurrency semaphore if configured (non-blocking)
+		if fc.concurrencySem != nil {
+			select {
+			case fc.concurrencySem <- struct{}{}:
+				defer func() { <-fc.concurrencySem }()
+			default:
+				select {
+				case errorChan <- ErrTooManyPageRequests:
+				default:
+				}
+				return
+			}
+		}
+
+		// acquire per-page-type concurrency semaphore if configured (non-blocking)
+		if fc.pageTypeSemLimit > 0 {
+			pageType := pageKey
+			if before, _, ok := strings.Cut(pageKey, ":"); ok {
+				pageType = before
+			}
+
+			typeSem := fc.getPageTypeSemaphore(pageType)
+			select {
+			case typeSem <- struct{}{}:
+				defer func() { <-typeSem }()
+			default:
+				select {
+				case errorChan <- ErrTooManyPageRequests:
+				default:
+				}
+				return
+			}
+		}
 
 		// check cache
 		if fc.cachingEnabled && caching && fc.getFrontendCache(pageKey, pageData) == nil {
 			logrus.Debugf("page served from cache: %v", pageKey)
-			if !isTimedOut {
+			select {
+			case <-callCtx.Done():
+			default:
 				returnChan <- pageData
 			}
 			return
@@ -149,13 +221,19 @@ func (fc *FrontendCacheService) processPageCall(pageKey string, caching bool, pa
 		// process page call
 		pageData = buildFn(pageCall)
 
-		if isTimedOut {
+		select {
+		case <-callCtx.Done():
 			return
+		default:
 		}
+
 		if fc.cachingEnabled && caching && pageCall.CacheTimeout >= 0 {
 			fc.setFrontendCache(pageKey, pageData, pageCall.CacheTimeout)
 		}
-		if !isTimedOut {
+
+		select {
+		case <-callCtx.Done():
+		default:
 			returnChan <- pageData
 		}
 	}(callIdx)
@@ -171,14 +249,27 @@ func (fc *FrontendCacheService) processPageCall(pageKey string, caching bool, pa
 	case returnError := <-errorChan:
 		return nil, returnError
 	case <-time.After(callTimeout):
-		isTimedOut = true
 		callCtxCancel()
+		goid := callGoId.Load()
 		return nil, &FrontendCachePageError{
 			name:  "page timeout",
 			err:   fmt.Errorf("page call %v timeout", callIdx),
-			stack: fc.extractPageCallStack(callGoId),
+			stack: fc.extractPageCallStack(goid),
 		}
 	}
+}
+
+func (fc *FrontendCacheService) getPageTypeSemaphore(pageType string) chan struct{} {
+	fc.pageTypeSemMutex.Lock()
+	defer fc.pageTypeSemMutex.Unlock()
+
+	sem, ok := fc.pageTypeSemaphores[pageType]
+	if !ok {
+		sem = make(chan struct{}, fc.pageTypeSemLimit)
+		fc.pageTypeSemaphores[pageType] = sem
+	}
+
+	return sem
 }
 
 func (fc *FrontendCacheService) getFrontendCache(pageKey string, returnValue interface{}) error {
@@ -195,6 +286,73 @@ func (fc *FrontendCacheService) completePageLoad(pageKey string, processingPage 
 	fc.processingMutex.Lock()
 	delete(fc.processingDict, pageKey)
 	fc.processingMutex.Unlock()
+}
+
+// FrontendCacheStats holds statistics about the frontend cache service.
+type FrontendCacheStats struct {
+	CachingEnabled     bool
+	PageCallCounter    uint64
+	ProcessingPages    int
+	ProcessingPageKeys []string
+	ConcurrencyLimit   int
+	ConcurrencyUsed    int
+	PageTypeSemLimit   int
+	PageTypeSemaphores map[string]int // page type -> current usage
+}
+
+// GetStats returns frontend cache statistics.
+func (fc *FrontendCacheService) GetStats() *FrontendCacheStats {
+	fc.pageCallCounterMutex.Lock()
+	callCounter := fc.pageCallCounter
+	fc.pageCallCounterMutex.Unlock()
+
+	fc.processingMutex.Lock()
+	processingKeys := make([]string, 0, len(fc.processingDict))
+	for key := range fc.processingDict {
+		processingKeys = append(processingKeys, key)
+	}
+	fc.processingMutex.Unlock()
+
+	concurrencyLimit := 0
+	concurrencyUsed := 0
+	if fc.concurrencySem != nil {
+		concurrencyLimit = cap(fc.concurrencySem)
+		concurrencyUsed = len(fc.concurrencySem)
+	}
+
+	fc.pageTypeSemMutex.Lock()
+	pageTypeSemUsage := make(map[string]int, len(fc.pageTypeSemaphores))
+	for pageType, sem := range fc.pageTypeSemaphores {
+		pageTypeSemUsage[pageType] = len(sem)
+	}
+	fc.pageTypeSemMutex.Unlock()
+
+	return &FrontendCacheStats{
+		CachingEnabled:     fc.cachingEnabled,
+		PageCallCounter:    callCounter,
+		ProcessingPages:    len(processingKeys),
+		ProcessingPageKeys: processingKeys,
+		ConcurrencyLimit:   concurrencyLimit,
+		ConcurrencyUsed:    concurrencyUsed,
+		PageTypeSemLimit:   fc.pageTypeSemLimit,
+		PageTypeSemaphores: pageTypeSemUsage,
+	}
+}
+
+// GetTieredCacheStats returns the underlying tiered cache statistics.
+func (fc *FrontendCacheService) GetTieredCacheStats() *cache.TieredCacheStats {
+	if fc.tieredCache == nil {
+		return nil
+	}
+	return fc.tieredCache.GetStats()
+}
+
+// GetPageTypeStats returns per-page-type cache statistics.
+func (fc *FrontendCacheService) GetPageTypeStats() []*cache.PageTypeStats {
+	if fc.tieredCache == nil {
+		return nil
+	}
+	return fc.tieredCache.GetPageTypeStats()
 }
 
 func (fc *FrontendCacheService) extractPageCallStack(callGoid uint64) string {

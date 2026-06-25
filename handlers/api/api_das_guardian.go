@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/utils"
-	dasguardian "github.com/probe-lab/eth-das-guardian"
+	dasguardian "github.com/ethpandaops/eth-das-guardian"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -137,7 +137,7 @@ func APIDasGuardianScan(w http.ResponseWriter, r *http.Request) {
 
 		// Create callback that will be called with node status
 		slotCallback := func(nodeStatus *dasguardian.StatusV2) ([]uint64, error) {
-			return selectRandomSlotsWithNodeStatus(req.RandomMode, int(randomCount), nodeStatus)
+			return selectRandomSlotsWithNodeStatus(r.Context(), req.RandomMode, int(randomCount), nodeStatus)
 		}
 
 		// Scan with callback
@@ -244,7 +244,7 @@ func APIDasGuardianScan(w http.ResponseWriter, r *http.Request) {
 }
 
 // selectRandomSlotsWithNodeStatus selects random slots based on the specified mode and node status
-func selectRandomSlotsWithNodeStatus(mode string, count int, nodeStatus *dasguardian.StatusV2) ([]uint64, error) {
+func selectRandomSlotsWithNodeStatus(ctx context.Context, mode string, count int, nodeStatus *dasguardian.StatusV2) ([]uint64, error) {
 	chainState := services.GlobalBeaconService.GetChainState()
 	currentSlot := uint64(chainState.CurrentSlot())
 
@@ -309,7 +309,7 @@ func selectRandomSlotsWithNodeStatus(mode string, count int, nodeStatus *dasguar
 			WithMissing:  1,
 		}
 
-		blocks := services.GlobalBeaconService.GetDbBlocksByFilter(filter, 0, 1, 0)
+		blocks := services.GlobalBeaconService.GetDbBlocksByFilter(ctx, filter, 0, 1, 0)
 
 		// Check conditions based on mode
 		switch mode {

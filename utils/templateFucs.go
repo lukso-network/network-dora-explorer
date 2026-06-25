@@ -24,10 +24,73 @@ func GetTemplateFuncs() template.FuncMap {
 		fm[k] = v
 	}
 
+	toInt64 := func(v interface{}) int64 {
+		switch x := v.(type) {
+		case int:
+			return int64(x)
+		case int8:
+			return int64(x)
+		case int16:
+			return int64(x)
+		case int32:
+			return int64(x)
+		case int64:
+			return x
+		case uint:
+			return int64(x)
+		case uint8:
+			return int64(x)
+		case uint16:
+			return int64(x)
+		case uint32:
+			return int64(x)
+		case uint64:
+			return int64(x)
+		case float32:
+			return int64(x)
+		case float64:
+			return int64(x)
+		default:
+			return 0
+		}
+	}
+
+	toFloat64 := func(v any) float64 {
+		switch x := v.(type) {
+		case int:
+			return float64(x)
+		case int8:
+			return float64(x)
+		case int16:
+			return float64(x)
+		case int32:
+			return float64(x)
+		case int64:
+			return float64(x)
+		case uint:
+			return float64(x)
+		case uint8:
+			return float64(x)
+		case uint16:
+			return float64(x)
+		case uint32:
+			return float64(x)
+		case uint64:
+			return float64(x)
+		case float32:
+			return float64(x)
+		case float64:
+			return x
+		default:
+			return 0
+		}
+	}
+
 	customFuncs := template.FuncMap{
 		"includeHTML": IncludeHTML,
 		"includeJSON": IncludeJSON,
 		"html":        func(x string) template.HTML { return template.HTML(x) },
+		"float64":     toFloat64,
 		"bigIntCmp":   func(i *big.Int, j int) int { return i.Cmp(big.NewInt(int64(j))) },
 		"mod":         func(i, j int) bool { return i%j == 0 },
 		"sub":         func(i, j int) int { return i - j },
@@ -46,44 +109,85 @@ func GetTemplateFuncs() template.FuncMap {
 		"round": func(i float64, n int) float64 {
 			return math.Round(i*math.Pow10(n)) / math.Pow10(n)
 		},
-		"uint64ToTime":                 func(i uint64) time.Time { return time.Unix(int64(i), 0).UTC() },
-		"percent":                      func(i float64) float64 { return i * 100 },
-		"contains":                     strings.Contains,
-		"tokenSymbol":                  tokenSymbol,
-		"formatAddCommas":              FormatAddCommas,
-		"formatFloat":                  FormatFloat,
-		"formatBaseFee":                FormatBaseFee,
-		"formatBlobFeeDifference":      FormatBlobFeeDifference,
-		"formatTransactionValue":       FormatTransactionValue,
-		"formatBitlist":                FormatBitlist,
-		"formatBitvectorValidators":    formatBitvectorValidators,
-		"formatParticipation":          FormatParticipation,
-		"formatEthFromGwei":            FormatETHFromGwei,
-		"formatEthFromGweiShort":       FormatETHFromGweiShort,
-		"formatFullEthFromGwei":        FormatFullEthFromGwei,
-		"formatEthAddCommasFromGwei":   FormatETHAddCommasFromGwei,
-		"formatBytesAmount":            FormatBytesAmount,
-		"formatAmount":                 FormatAmount,
-		"formatBigAmount":              FormatBigAmount,
-		"formatAmountFormatted":        FormatAmountFormatted,
-		"formatGwei":                   FormatGweiValue,
-		"formatByteAmount":             FormatByteAmount,
-		"percentage":                   CalculatePercentage,
-		"ethBlockLink":                 FormatEthBlockLink,
-		"ethBlockHashLink":             FormatEthBlockHashLink,
-		"ethAddressLink":               FormatEthAddressLink,
-		"ethTransactionLink":           FormatEthTransactionLink,
-		"formatEthAddress":             FormatEthAddress,
-		"formatValidator":              FormatValidator,
-		"formatValidatorWithIndex":     FormatValidatorWithIndex,
-		"formatValidatorNameWithIndex": FormatValidatorNameWithIndex,
-		"formatSlashedValidator":       FormatSlashedValidator,
-		"formatWithdawalCredentials":   FormatWithdawalCredentials,
-		"formatRecentTimeShort":        FormatRecentTimeShort,
-		"formatGraffiti":               FormatGraffiti,
-		"formatRecvDelay":              FormatRecvDelay,
-		"formatPercentageAlert":        formatPercentageAlert,
-		"formatAlertNumber":            formatAlertNumber,
+		"uint64ToTime":                  func(i uint64) time.Time { return time.Unix(int64(i), 0).UTC() },
+		"percent":                       func(i float64) float64 { return i * 100 },
+		"contains":                      strings.Contains,
+		"tokenSymbol":                   tokenSymbol,
+		"formatAddCommas":               FormatAddCommas,
+		"formatFloat":                   FormatFloat,
+		"formatTokenAmount":             FormatTokenAmount,
+		"formatBaseFee":                 FormatBaseFee,
+		"formatBlobFeeDifference":       FormatBlobFeeDifference,
+		"formatTransactionValue":        FormatTransactionValue,
+		"formatTransactionFee":          FormatTransactionFee,
+		"formatBitlist":                 FormatBitlist,
+		"formatBitvectorValidators":     formatBitvectorValidators,
+		"formatParticipation":           FormatParticipation,
+		"formatEthFromGwei":             FormatETHFromGwei,
+		"formatEthFromGweiP":            FormatETHFromGweiP,
+		"formatEthFromGweiShort":        FormatETHFromGweiShort,
+		"formatFullEthFromGwei":         FormatFullEthFromGwei,
+		"formatEthAddCommasFromGwei":    FormatETHAddCommasFromGwei,
+		"formatBytesAmount":             FormatBytesAmount,
+		"formatAmount":                  FormatAmount,
+		"formatBigAmount":               FormatBigAmount,
+		"formatAmountFormatted":         FormatAmountFormatted,
+		"formatGwei":                    FormatGweiValue,
+		"formatByteAmount":              FormatByteAmount,
+		"percentage":                    CalculatePercentage,
+		"ethBlockLink":                  FormatEthBlockLink,
+		"ethBlockHashLink":              FormatEthBlockHashLink,
+		"ethAddressLink":                FormatEthAddressLink,
+		"ethTransactionLink":            FormatEthTransactionLink,
+		"formatEthAddress":              FormatEthAddress,
+		"formatEthAddressShort":         FormatEthAddressShort,
+		"formatEthAddressShortLink":     FormatEthAddressShortLink,
+		"formatEthAddressFull":          FormatEthAddressFull,
+		"formatEthAddressFullLink":      FormatEthAddressFullLink,
+		"formatHexBytes":                FormatHexBytes,
+		"formatHexBytesShort":           FormatHexBytesShort,
+		"formatWeiAmount":               FormatWeiAmount,
+		"formatWeiDeltaAmount":          FormatWeiDeltaAmount,
+		"formatNFTTokenID":              FormatNFTTokenID,
+		"formatEthHashShort":            FormatEthHashShort,
+		"formatContractCreationLink":    FormatContractCreationLink,
+		"formatValidator":               FormatValidator,
+		"formatValidatorWithIndex":      FormatValidatorWithIndex,
+		"formatValidatorNameWithIndex":  FormatValidatorNameWithIndex,
+		"formatProposerWithBuildSource": FormatProposerWithBuildSource,
+		"formatSlashedValidator":        FormatSlashedValidator,
+		"formatBuilder":                 FormatBuilder,
+		"formatBuilderWithIndex":        FormatBuilderWithIndex,
+		"formatInactiveBuilder":         FormatInactiveBuilder,
+		"formatBuilderWithURL":          FormatBuilderWithURL,
+		"formatBuilderWithIndexAndURL":  FormatBuilderWithIndexAndURL,
+		"formatWithdawalCredentials":    FormatWithdawalCredentials,
+		"formatRecentTimeShort":         FormatRecentTimeShort,
+		"formatGraffiti":                FormatGraffiti,
+		"formatSlotStatusTooltip":       FormatSlotStatusTooltip,
+		"formatRecvDelay":               FormatRecvDelay,
+		"formatPercentageAlert":         formatPercentageAlert,
+		"formatAlertNumber":             formatAlertNumber,
+		"isSystemContract":              IsSystemContract,
+		"getSystemContractName":         GetSystemContractName,
+		"calculateBalanceDiff":          CalculateBalanceDiff,
+		"bitwiseAnd":                    func(a, b interface{}) int64 { return toInt64(a) & toInt64(b) },
+		"formatByteSize": func(v any) template.HTML {
+			n := toInt64(v)
+			if n < 0 {
+				return template.HTML("N/A")
+			}
+			return FormatByteAmount(uint64(n))
+		},
+		"formatNumber": func(v any) template.HTML { return FormatAddCommas(uint64(toInt64(v))) },
+		"pct": func(a, b any) float64 {
+			af := toFloat64(a)
+			bf := toFloat64(b)
+			if bf == 0 {
+				return 0
+			}
+			return af / bf * 100
+		},
 	}
 
 	for k, v := range customFuncs {

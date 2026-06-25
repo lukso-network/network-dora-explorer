@@ -8,10 +8,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 )
@@ -67,7 +67,7 @@ func ApiValidatorByEth1AddressV1(w http.ResponseWriter, r *http.Request) {
 
 	canonicalForkIds := services.GlobalBeaconService.GetCanonicalForkIds()
 
-	deposits, _, err := db.GetDepositTxsFiltered(uint64(offset), uint32(limit), canonicalForkIds, &dbtypes.DepositTxFilter{
+	deposits, _, err := db.GetDepositTxsFiltered(r.Context(), uint64(offset), uint32(limit), canonicalForkIds, &dbtypes.DepositTxFilter{
 		Address: eth1Address,
 	})
 	if err != nil {

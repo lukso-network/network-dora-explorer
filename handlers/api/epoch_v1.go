@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/services"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 )
@@ -84,7 +84,7 @@ func ApiEpochV1(w http.ResponseWriter, r *http.Request) {
 		Finalized: finalizedEpoch >= phase0.Epoch(epoch),
 	}
 
-	dbEpochs := services.GlobalBeaconService.GetDbEpochs(uint64(epoch), 1)
+	dbEpochs := services.GlobalBeaconService.GetDbEpochs(r.Context(), uint64(epoch), 1)
 	dbEpoch := dbEpochs[0]
 	if dbEpoch != nil {
 		data.AttestationsCount = dbEpoch.AttestationCount
@@ -96,7 +96,9 @@ func ApiEpochV1(w http.ResponseWriter, r *http.Request) {
 		data.AttesterSlashingsCount = dbEpoch.AttesterSlashingCount
 		data.EligibleEther = dbEpoch.Eligible
 		data.VotedEther = dbEpoch.VotedTotal
-		data.GlobalParticipationRate = uint64(dbEpoch.VotedTarget * 100 / dbEpoch.Eligible)
+		if dbEpoch.Eligible > 0 {
+			data.GlobalParticipationRate = uint64(dbEpoch.VotedTarget * 100 / dbEpoch.Eligible)
+		}
 		data.ValidatorsCount = dbEpoch.ValidatorCount
 		data.TotalValidatorBalance = dbEpoch.ValidatorBalance
 		if dbEpoch.ValidatorCount > 0 {

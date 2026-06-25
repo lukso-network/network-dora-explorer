@@ -1,18 +1,19 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -68,6 +69,7 @@ func VoluntaryExits(w http.ResponseWriter, r *http.Request) {
 	} else {
 		withOrphaned = 1
 	}
+
 	var pageError error
 	pageError = services.GlobalCallRateLimiter.CheckCallLimit(r, 2)
 	if pageError == nil {
@@ -86,8 +88,8 @@ func VoluntaryExits(w http.ResponseWriter, r *http.Request) {
 func getFilteredVoluntaryExitsPageData(pageIdx uint64, pageSize uint64, minSlot uint64, maxSlot uint64, minIndex uint64, maxIndex uint64, vname string, withOrphaned uint8) (*models.VoluntaryExitsPageData, error) {
 	pageData := &models.VoluntaryExitsPageData{}
 	pageCacheKey := fmt.Sprintf("voluntary_exits:%v:%v:%v:%v:%v:%v:%v:%v", pageIdx, pageSize, minSlot, maxSlot, minIndex, maxIndex, vname, withOrphaned)
-	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(_ *services.FrontendCacheProcessingPage) interface{} {
-		return buildFilteredVoluntaryExitsPageData(pageIdx, pageSize, minSlot, maxSlot, minIndex, maxIndex, vname, withOrphaned)
+	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
+		return buildFilteredVoluntaryExitsPageData(pageCall.CallCtx, pageIdx, pageSize, minSlot, maxSlot, minIndex, maxIndex, vname, withOrphaned)
 	})
 	if pageErr == nil && pageRes != nil {
 		resData, resOk := pageRes.(*models.VoluntaryExitsPageData)
@@ -99,7 +101,7 @@ func getFilteredVoluntaryExitsPageData(pageIdx uint64, pageSize uint64, minSlot 
 	return pageData, pageErr
 }
 
-func buildFilteredVoluntaryExitsPageData(pageIdx uint64, pageSize uint64, minSlot uint64, maxSlot uint64, minIndex uint64, maxIndex uint64, vname string, withOrphaned uint8) *models.VoluntaryExitsPageData {
+func buildFilteredVoluntaryExitsPageData(ctx context.Context, pageIdx uint64, pageSize uint64, minSlot uint64, maxSlot uint64, minIndex uint64, maxIndex uint64, vname string, withOrphaned uint8) *models.VoluntaryExitsPageData {
 	filterArgs := url.Values{}
 	if minSlot != 0 {
 		filterArgs.Add("f.mins", fmt.Sprintf("%v", minSlot))
@@ -153,7 +155,7 @@ func buildFilteredVoluntaryExitsPageData(pageIdx uint64, pageSize uint64, minSlo
 		WithOrphaned:  withOrphaned,
 	}
 
-	dbVoluntaryExits, totalRows := services.GlobalBeaconService.GetVoluntaryExitsByFilter(voluntaryExitFilter, pageIdx-1, uint32(pageSize))
+	dbVoluntaryExits, totalRows := services.GlobalBeaconService.GetVoluntaryExitsByFilter(ctx, voluntaryExitFilter, pageIdx-1, uint32(pageSize))
 
 	chainState := services.GlobalBeaconService.GetChainState()
 
@@ -163,10 +165,11 @@ func buildFilteredVoluntaryExitsPageData(pageIdx uint64, pageSize uint64, minSlo
 			SlotRoot:        voluntaryExit.SlotRoot,
 			Time:            chainState.SlotToTime(phase0.Slot(voluntaryExit.SlotNumber)),
 			Orphaned:        voluntaryExit.Orphaned,
-			ValidatorIndex:  voluntaryExit.ValidatorIndex,
-			ValidatorName:   services.GlobalBeaconService.GetValidatorName(voluntaryExit.ValidatorIndex),
 			ValidatorStatus: "",
 		}
+
+		voluntaryExitData.ValidatorIndex = voluntaryExit.ValidatorIndex
+		voluntaryExitData.ValidatorName = services.GlobalBeaconService.GetValidatorName(voluntaryExit.ValidatorIndex)
 
 		validator := services.GlobalBeaconService.GetValidatorByIndex(phase0.ValidatorIndex(voluntaryExit.ValidatorIndex), false)
 		if validator == nil {
@@ -219,13 +222,19 @@ func buildFilteredVoluntaryExitsPageData(pageIdx uint64, pageSize uint64, minSlo
 	}
 
 	// Populate UrlParams for page jump functionality
-	pageData.UrlParams = make(map[string]string)
+	pageData.UrlParams = make([]models.UrlParam, 0)
 	for key, values := range filterArgs {
 		if len(values) > 0 {
-			pageData.UrlParams[key] = values[0]
+			pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{
+				Key:   key,
+				Value: values[0],
+			})
 		}
 	}
-	pageData.UrlParams["c"] = fmt.Sprintf("%v", pageData.PageSize)
+	pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{
+		Key:   "c",
+		Value: fmt.Sprintf("%v", pageData.PageSize),
+	})
 
 	pageData.FirstPageLink = fmt.Sprintf("/validators/voluntary_exits?f&%v&c=%v", filterArgs.Encode(), pageData.PageSize)
 	pageData.PrevPageLink = fmt.Sprintf("/validators/voluntary_exits?f&%v&c=%v&p=%v", filterArgs.Encode(), pageData.PageSize, pageData.PrevPageIndex)

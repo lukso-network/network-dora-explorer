@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -9,7 +10,7 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-func InsertDepositTxs(depositTxs []*dbtypes.DepositTx, tx *sqlx.Tx) error {
+func InsertDepositTxs(ctx context.Context, tx *sqlx.Tx, depositTxs []*dbtypes.DepositTx) error {
 	var sql strings.Builder
 	fmt.Fprint(&sql,
 		EngineQuery(map[dbtypes.DBEngineType]string{
@@ -58,14 +59,14 @@ func InsertDepositTxs(depositTxs []*dbtypes.DepositTx, tx *sqlx.Tx) error {
 		dbtypes.DBEngineSqlite: "",
 	}))
 
-	_, err := tx.Exec(sql.String(), args...)
+	_, err := tx.ExecContext(ctx, sql.String(), args...)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func GetDepositTxs(firstIndex uint64, limit uint32) []*dbtypes.DepositTx {
+func GetDepositTxs(ctx context.Context, firstIndex uint64, limit uint32) []*dbtypes.DepositTx {
 	var sql strings.Builder
 	args := []any{}
 	fmt.Fprint(&sql, `
@@ -85,7 +86,7 @@ func GetDepositTxs(firstIndex uint64, limit uint32) []*dbtypes.DepositTx {
 	`, len(args))
 
 	depositTxs := []*dbtypes.DepositTx{}
-	err := ReaderDb.Select(&depositTxs, sql.String(), args...)
+	err := ReaderDb.SelectContext(ctx, &depositTxs, sql.String(), args...)
 	if err != nil {
 		logger.Errorf("Error while fetching deposit txs: %v", err)
 		return nil
@@ -93,39 +94,96 @@ func GetDepositTxs(firstIndex uint64, limit uint32) []*dbtypes.DepositTx {
 	return depositTxs
 }
 
-func GetDepositTxsByIndexes(indexes []uint64) []*dbtypes.DepositTx {
+func GetDepositTxsByIndexes(ctx context.Context, indexes []uint64) []*dbtypes.DepositTx {
 	depositTxs := []*dbtypes.DepositTx{}
 	if len(indexes) == 0 {
 		return depositTxs
 	}
 
-	var sql strings.Builder
-	args := []interface{}{}
+	// SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 (32766 in newer
+	// builds). Chunk to stay well below that on every supported build,
+	// otherwise high-deposit-volume queries fail with
+	// "too many SQL variables".
+	const maxParams = 900
 
-	fmt.Fprint(&sql, `SELECT deposit_txs.*
-		FROM deposit_txs
-		WHERE deposit_index IN (
-	`)
-
-	for idx, index := range indexes {
-		if idx > 0 {
-			fmt.Fprintf(&sql, ", ")
+	for start := 0; start < len(indexes); start += maxParams {
+		end := start + maxParams
+		if end > len(indexes) {
+			end = len(indexes)
 		}
-		args = append(args, index)
-		fmt.Fprintf(&sql, "$%v", len(args))
-	}
-	fmt.Fprintf(&sql, ")")
+		chunk := indexes[start:end]
 
-	err := ReaderDb.Select(&depositTxs, sql.String(), args...)
-	if err != nil {
-		logger.Errorf("Error while fetching deposit txs by indexes: %v", err)
-		return nil
+		var sql strings.Builder
+		args := make([]any, len(chunk))
+
+		fmt.Fprint(&sql, `SELECT deposit_txs.*
+			FROM deposit_txs
+			WHERE deposit_index IN (
+		`)
+
+		for idx, index := range chunk {
+			args[idx] = index
+		}
+		appendDollarPlaceholders(&sql, 1, len(chunk), ", ")
+		fmt.Fprintf(&sql, ")")
+
+		var chunkResult []*dbtypes.DepositTx
+		err := ReaderDb.SelectContext(ctx, &chunkResult, sql.String(), args...)
+		if err != nil {
+			logger.Errorf("Error while fetching deposit txs by indexes: %v", err)
+			return nil
+		}
+		depositTxs = append(depositTxs, chunkResult...)
 	}
 
 	return depositTxs
 }
 
-func GetDepositTxsFiltered(offset uint64, limit uint32, canonicalForkIds []uint64, filter *dbtypes.DepositTxFilter) ([]*dbtypes.DepositTx, uint64, error) {
+func GetDepositTxsByPublicKeys(ctx context.Context, publicKeys [][]byte) []*dbtypes.DepositTx {
+	depositTxs := []*dbtypes.DepositTx{}
+	if len(publicKeys) == 0 {
+		return depositTxs
+	}
+
+	// SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 (32766 in newer
+	// builds). Chunk to stay well below that on every supported build,
+	// otherwise high-volume queries fail with "too many SQL variables".
+	const maxParams = 900
+
+	for start := 0; start < len(publicKeys); start += maxParams {
+		end := start + maxParams
+		if end > len(publicKeys) {
+			end = len(publicKeys)
+		}
+		chunk := publicKeys[start:end]
+
+		var sql strings.Builder
+		args := make([]any, len(chunk))
+
+		fmt.Fprint(&sql, `SELECT deposit_txs.*
+			FROM deposit_txs
+			WHERE publickey IN (
+		`)
+
+		for idx, publicKey := range chunk {
+			args[idx] = publicKey
+		}
+		appendDollarPlaceholders(&sql, 1, len(chunk), ", ")
+		fmt.Fprintf(&sql, ") ORDER BY block_number ASC, deposit_index ASC")
+
+		var chunkResult []*dbtypes.DepositTx
+		err := ReaderDb.SelectContext(ctx, &chunkResult, sql.String(), args...)
+		if err != nil {
+			logger.Errorf("Error while fetching deposit txs by public keys: %v", err)
+			return nil
+		}
+		depositTxs = append(depositTxs, chunkResult...)
+	}
+
+	return depositTxs
+}
+
+func GetDepositTxsFiltered(ctx context.Context, offset uint64, limit uint32, canonicalForkIds []uint64, filter *dbtypes.DepositTxFilter) ([]*dbtypes.DepositTx, uint64, error) {
 	var sql strings.Builder
 	args := []any{}
 	fmt.Fprint(&sql, `
@@ -163,13 +221,11 @@ func GetDepositTxsFiltered(offset uint64, limit uint32, canonicalForkIds []uint6
 	}
 	if len(filter.PublicKeys) > 0 {
 		fmt.Fprintf(&sql, " %v publickey IN (", filterOp)
-		for i, pubKey := range filter.PublicKeys {
-			if i > 0 {
-				fmt.Fprintf(&sql, ", ")
-			}
+		start := len(args) + 1
+		for _, pubKey := range filter.PublicKeys {
 			args = append(args, pubKey)
-			fmt.Fprintf(&sql, "$%v", len(args))
 		}
+		appendDollarPlaceholders(&sql, start, len(filter.PublicKeys), ", ")
 		fmt.Fprintf(&sql, ")")
 		filterOp = "AND"
 	}
@@ -195,23 +251,7 @@ func GetDepositTxsFiltered(offset uint64, limit uint32, canonicalForkIds []uint6
 		filterOp = "AND"
 	}
 
-	if filter.WithOrphaned != 1 {
-		forkIdStr := make([]string, len(canonicalForkIds))
-		for i, forkId := range canonicalForkIds {
-			forkIdStr[i] = fmt.Sprintf("%v", forkId)
-		}
-		if len(forkIdStr) == 0 {
-			forkIdStr = append(forkIdStr, "0")
-		}
-
-		if filter.WithOrphaned == 0 {
-			fmt.Fprintf(&sql, " %v fork_id IN (%v)", filterOp, strings.Join(forkIdStr, ","))
-			filterOp = "AND"
-		} else if filter.WithOrphaned == 2 {
-			fmt.Fprintf(&sql, " %v fork_id NOT IN (%v)", filterOp, strings.Join(forkIdStr, ","))
-			filterOp = "AND"
-		}
-	}
+	appendWithOrphanedFilter(&sql, &args, &filterOp, filter.WithOrphaned, canonicalForkIds, "fork_id")
 
 	if filter.WithValid == 0 {
 		fmt.Fprintf(&sql, " %v valid_signature IN (1, 2)", filterOp)
@@ -252,7 +292,7 @@ func GetDepositTxsFiltered(offset uint64, limit uint32, canonicalForkIds []uint6
 	fmt.Fprintf(&sql, ") AS t1")
 
 	depositTxs := []*dbtypes.DepositTx{}
-	err := ReaderDb.Select(&depositTxs, sql.String(), args...)
+	err := ReaderDb.SelectContext(ctx, &depositTxs, sql.String(), args...)
 	if err != nil {
 		logger.Errorf("Error while fetching filtered deposit txs: %v", err)
 		return nil, 0, err

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,9 +12,10 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
 
 	"github.com/ethpandaops/dora/dbtypes"
+	"github.com/ethpandaops/dora/indexer/beacon"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
@@ -51,6 +53,7 @@ func Validators(w http.ResponseWriter, r *http.Request) {
 	var filterName string
 	var filterStatus string
 	var filterWithdrawal string
+	var filterCredTypes []uint8
 	if urlArgs.Has("f") {
 		if urlArgs.Has("f.pubkey") {
 			filterPubKey = urlArgs.Get("f.pubkey")
@@ -67,6 +70,17 @@ func Validators(w http.ResponseWriter, r *http.Request) {
 		if urlArgs.Has("f.withdrawal") {
 			filterWithdrawal = urlArgs.Get("f.withdrawal")
 		}
+		if vals, ok := urlArgs["f.cred"]; ok {
+			seen := map[uint8]bool{}
+			for _, v := range vals {
+				t, err := strconv.ParseUint(v, 10, 8)
+				if err != nil || t > 3 || seen[uint8(t)] {
+					continue
+				}
+				seen[uint8(t)] = true
+				filterCredTypes = append(filterCredTypes, uint8(t))
+			}
+		}
 	}
 	var sortOrder string
 	if urlArgs.Has("o") {
@@ -76,7 +90,7 @@ func Validators(w http.ResponseWriter, r *http.Request) {
 	var pageError error
 	pageError = services.GlobalCallRateLimiter.CheckCallLimit(r, 1)
 	if pageError == nil {
-		data.Data, pageError = getValidatorsPageData(pageNumber, pageSize, sortOrder, filterPubKey, filterIndex, filterName, filterStatus, filterWithdrawal)
+		data.Data, pageError = getValidatorsPageData(pageNumber, pageSize, sortOrder, filterPubKey, filterIndex, filterName, filterStatus, filterWithdrawal, filterCredTypes)
 	}
 	if pageError != nil {
 		handlePageError(w, r, pageError)
@@ -98,11 +112,11 @@ func Validators(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func getValidatorsPageData(pageNumber uint64, pageSize uint64, sortOrder string, filterPubKey string, filterIndex string, filterName string, filterStatus string, filterWithdrawal string) (*models.ValidatorsPageData, error) {
+func getValidatorsPageData(pageNumber uint64, pageSize uint64, sortOrder string, filterPubKey string, filterIndex string, filterName string, filterStatus string, filterWithdrawal string, filterCredTypes []uint8) (*models.ValidatorsPageData, error) {
 	pageData := &models.ValidatorsPageData{}
-	pageCacheKey := fmt.Sprintf("validators:%v:%v:%v:%v:%v:%v:%v:%v", pageNumber, pageSize, sortOrder, filterPubKey, filterIndex, filterName, filterStatus, filterWithdrawal)
+	pageCacheKey := fmt.Sprintf("validators:%v:%v:%v:%v:%v:%v:%v:%v:%v", pageNumber, pageSize, sortOrder, filterPubKey, filterIndex, filterName, filterStatus, filterWithdrawal, filterCredTypes)
 	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
-		pageData, cacheTimeout := buildValidatorsPageData(pageNumber, pageSize, sortOrder, filterPubKey, filterIndex, filterName, filterStatus, filterWithdrawal)
+		pageData, cacheTimeout := buildValidatorsPageData(pageCall.CallCtx, pageNumber, pageSize, sortOrder, filterPubKey, filterIndex, filterName, filterStatus, filterWithdrawal, filterCredTypes)
 		pageCall.CacheTimeout = cacheTimeout
 		return pageData
 	})
@@ -116,8 +130,8 @@ func getValidatorsPageData(pageNumber uint64, pageSize uint64, sortOrder string,
 	return pageData, pageErr
 }
 
-func buildValidatorsPageData(pageNumber uint64, pageSize uint64, sortOrder string, filterPubKey string, filterIndex string, filterName string, filterStatus string, filterWithdrawal string) (*models.ValidatorsPageData, time.Duration) {
-	logrus.Debugf("validators page called: %v:%v:%v:%v:%v:%v:%v:%v", pageNumber, pageSize, sortOrder, filterPubKey, filterIndex, filterName, filterStatus, filterWithdrawal)
+func buildValidatorsPageData(ctx context.Context, pageNumber uint64, pageSize uint64, sortOrder string, filterPubKey string, filterIndex string, filterName string, filterStatus string, filterWithdrawal string, filterCredTypes []uint8) (*models.ValidatorsPageData, time.Duration) {
+	logrus.Debugf("validators page called: %v:%v:%v:%v:%v:%v:%v:%v:%v", pageNumber, pageSize, sortOrder, filterPubKey, filterIndex, filterName, filterStatus, filterWithdrawal, filterCredTypes)
 	pageData := &models.ValidatorsPageData{}
 	cacheTime := 10 * time.Minute
 
@@ -129,7 +143,8 @@ func buildValidatorsPageData(pageNumber uint64, pageSize uint64, sortOrder strin
 	}
 
 	filterArgs := url.Values{}
-	if filterPubKey != "" || filterIndex != "" || filterName != "" || filterStatus != "" || filterWithdrawal != "" {
+	pageData.FilterCredTypes = make(map[uint8]bool, len(filterCredTypes))
+	if filterPubKey != "" || filterIndex != "" || filterName != "" || filterStatus != "" || filterWithdrawal != "" || len(filterCredTypes) > 0 {
 		if filterPubKey != "" {
 			pageData.FilterPubKey = filterPubKey
 			filterArgs.Add("f.pubkey", filterPubKey)
@@ -172,6 +187,13 @@ func buildValidatorsPageData(pageNumber uint64, pageSize uint64, sortOrder strin
 				validatorFilter.WithdrawalCreds = []byte{0xff}
 			}
 		}
+		if len(filterCredTypes) > 0 {
+			validatorFilter.WithdrawalCredTypes = filterCredTypes
+			for _, t := range filterCredTypes {
+				pageData.FilterCredTypes[t] = true
+				filterArgs.Add("f.cred", fmt.Sprintf("%v", t))
+			}
+		}
 	}
 
 	// apply sort order
@@ -203,7 +225,7 @@ func buildValidatorsPageData(pageNumber uint64, pageSize uint64, sortOrder strin
 
 	// get latest validator set
 	var validatorSet []v1.Validator
-	validatorSetRsp, validatorSetLen := services.GlobalBeaconService.GetFilteredValidatorSet(&validatorFilter, true)
+	validatorSetRsp, validatorSetLen := services.GlobalBeaconService.GetFilteredValidatorSet(ctx, &validatorFilter, true)
 	if len(validatorSetRsp) == 0 {
 		cacheTime = 5 * time.Minute
 		validatorSet = []v1.Validator{}
@@ -261,6 +283,7 @@ func buildValidatorsPageData(pageNumber uint64, pageSize uint64, sortOrder strin
 
 		validatorData := &models.ValidatorsPageDataValidator{
 			Index:            uint64(validator.Index),
+			ProjectedIndex:   beacon.IsProjectedValidator(validator.Validator),
 			Name:             services.GlobalBeaconService.GetValidatorName(uint64(validator.Index)),
 			PublicKey:        validator.Validator.PublicKey[:],
 			Balance:          uint64(validator.Balance),
@@ -290,12 +313,12 @@ func buildValidatorsPageData(pageNumber uint64, pageSize uint64, sortOrder strin
 			validatorData.UpcheckMaximum = uint8(3)
 		}
 
-		if validator.Validator.ActivationEpoch < 18446744073709551615 {
+		if validator.Validator.ActivationEligibilityEpoch < beacon.FarFutureEpoch && validator.Validator.ActivationEpoch < beacon.FarFutureEpoch {
 			validatorData.ShowActivation = true
 			validatorData.ActivationEpoch = uint64(validator.Validator.ActivationEpoch)
 			validatorData.ActivationTs = chainState.EpochToTime(validator.Validator.ActivationEpoch)
 		}
-		if validator.Validator.ExitEpoch < 18446744073709551615 {
+		if validator.Validator.ExitEpoch < beacon.FarFutureEpoch {
 			validatorData.ShowExit = true
 			validatorData.ExitEpoch = uint64(validator.Validator.ExitEpoch)
 			validatorData.ExitTs = chainState.EpochToTime(validator.Validator.ExitEpoch)
@@ -312,13 +335,19 @@ func buildValidatorsPageData(pageNumber uint64, pageSize uint64, sortOrder strin
 	pageData.LastValidator = pageData.FirstValidator + uint64(len(pageData.Validators))
 
 	// Populate UrlParams for page jump functionality
-	pageData.UrlParams = make(map[string]string)
+	pageData.UrlParams = make([]models.UrlParam, 0)
 	for key, values := range filterArgs {
 		if len(values) > 0 {
-			pageData.UrlParams[key] = values[0]
+			pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{
+				Key:   key,
+				Value: values[0],
+			})
 		}
 	}
-	pageData.UrlParams["c"] = fmt.Sprintf("%v", pageData.PageSize)
+	pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{
+		Key:   "c",
+		Value: fmt.Sprintf("%v", pageData.PageSize),
+	})
 
 	pageData.FilteredPageLink = fmt.Sprintf("/validators?f&%v&c=%v", filterArgs.Encode(), pageData.PageSize)
 

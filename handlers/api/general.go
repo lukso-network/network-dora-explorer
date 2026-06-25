@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -9,10 +10,10 @@ import (
 	"strconv"
 	"strings"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -52,7 +53,7 @@ func parseValidatorParamsToIndices(origParam string, limit int) (indices []phase
 	return
 }
 
-func parseValidatorParamsToPubkeys(origParam string, limit int) (pubkeys [][]byte, err error) {
+func parseValidatorParamsToPubkeys(ctx context.Context, origParam string, limit int) (pubkeys [][]byte, err error) {
 	params := strings.Split(origParam, ",")
 	if len(params) > limit {
 		return nil, fmt.Errorf("only a maximum of %d query parameters are allowed", limit)
@@ -84,7 +85,7 @@ func parseValidatorParamsToPubkeys(origParam string, limit int) (pubkeys [][]byt
 
 	if len(indices) > 0 {
 		// lookup pubkeys from validator set
-		validators, _ := services.GlobalBeaconService.GetFilteredValidatorSet(&dbtypes.ValidatorFilter{
+		validators, _ := services.GlobalBeaconService.GetFilteredValidatorSet(ctx, &dbtypes.ValidatorFilter{
 			Indices: indices,
 		}, false)
 

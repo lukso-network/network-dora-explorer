@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -8,7 +9,7 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-func InsertWithdrawalRequestTxs(withdrawalTxs []*dbtypes.WithdrawalRequestTx, tx *sqlx.Tx) error {
+func InsertWithdrawalRequestTxs(ctx context.Context, tx *sqlx.Tx, withdrawalTxs []*dbtypes.WithdrawalRequestTx) error {
 	var sql strings.Builder
 	fmt.Fprint(&sql,
 		EngineQuery(map[dbtypes.DBEngineType]string{
@@ -56,17 +57,17 @@ func InsertWithdrawalRequestTxs(withdrawalTxs []*dbtypes.WithdrawalRequestTx, tx
 		dbtypes.DBEngineSqlite: "",
 	}))
 
-	_, err := tx.Exec(sql.String(), args...)
+	_, err := tx.ExecContext(ctx, sql.String(), args...)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func GetWithdrawalRequestTxsByDequeueRange(dequeueFirst uint64, dequeueLast uint64) []*dbtypes.WithdrawalRequestTx {
+func GetWithdrawalRequestTxsByDequeueRange(ctx context.Context, dequeueFirst uint64, dequeueLast uint64) []*dbtypes.WithdrawalRequestTx {
 	withdrawalTxs := []*dbtypes.WithdrawalRequestTx{}
 
-	err := ReaderDb.Select(&withdrawalTxs, `SELECT withdrawal_request_txs.*
+	err := ReaderDb.SelectContext(ctx, &withdrawalTxs, `SELECT withdrawal_request_txs.*
 		FROM withdrawal_request_txs
 		WHERE dequeue_block >= $1 AND dequeue_block <= $2
 		ORDER BY dequeue_block ASC, block_number ASC, block_index ASC
@@ -79,9 +80,9 @@ func GetWithdrawalRequestTxsByDequeueRange(dequeueFirst uint64, dequeueLast uint
 	return withdrawalTxs
 }
 
-func GetWithdrawalRequestTxsByTxHashes(txHashes [][]byte) []*dbtypes.WithdrawalRequestTx {
+func GetWithdrawalRequestTxsByTxHashes(ctx context.Context, txHashes [][]byte) []*dbtypes.WithdrawalRequestTx {
 	var sql strings.Builder
-	args := []interface{}{}
+	args := make([]any, len(txHashes))
 
 	fmt.Fprint(&sql, `SELECT withdrawal_request_txs.*
 		FROM withdrawal_request_txs
@@ -89,16 +90,13 @@ func GetWithdrawalRequestTxsByTxHashes(txHashes [][]byte) []*dbtypes.WithdrawalR
 	`)
 
 	for idx, txHash := range txHashes {
-		if idx > 0 {
-			fmt.Fprintf(&sql, ", ")
-		}
-		args = append(args, txHash)
-		fmt.Fprintf(&sql, "$%v", len(args))
+		args[idx] = txHash
 	}
+	appendDollarPlaceholders(&sql, 1, len(txHashes), ", ")
 	fmt.Fprintf(&sql, ")")
 
 	withdrawalTxs := []*dbtypes.WithdrawalRequestTx{}
-	err := ReaderDb.Select(&withdrawalTxs, sql.String(), args...)
+	err := ReaderDb.SelectContext(ctx, &withdrawalTxs, sql.String(), args...)
 	if err != nil {
 		logger.Errorf("Error while fetching withdrawal request txs: %v", err)
 		return nil
@@ -107,7 +105,7 @@ func GetWithdrawalRequestTxsByTxHashes(txHashes [][]byte) []*dbtypes.WithdrawalR
 	return withdrawalTxs
 }
 
-func GetWithdrawalRequestTxsFiltered(offset uint64, limit uint32, canonicalForkIds []uint64, filter *dbtypes.WithdrawalRequestTxFilter) ([]*dbtypes.WithdrawalRequestTx, uint64, error) {
+func GetWithdrawalRequestTxsFiltered(ctx context.Context, offset uint64, limit uint32, canonicalForkIds []uint64, filter *dbtypes.WithdrawalRequestTxFilter) ([]*dbtypes.WithdrawalRequestTx, uint64, error) {
 	var sql strings.Builder
 	args := []interface{}{}
 	fmt.Fprint(&sql, `
@@ -174,23 +172,7 @@ func GetWithdrawalRequestTxsFiltered(offset uint64, limit uint32, canonicalForkI
 		filterOp = "AND"
 	}
 
-	if filter.WithOrphaned != 1 {
-		forkIdStr := make([]string, len(canonicalForkIds))
-		for i, forkId := range canonicalForkIds {
-			forkIdStr[i] = fmt.Sprintf("%v", forkId)
-		}
-		if len(forkIdStr) == 0 {
-			forkIdStr = append(forkIdStr, "0")
-		}
-
-		if filter.WithOrphaned == 0 {
-			fmt.Fprintf(&sql, " %v fork_id IN (%v)", filterOp, strings.Join(forkIdStr, ","))
-			filterOp = "AND"
-		} else if filter.WithOrphaned == 2 {
-			fmt.Fprintf(&sql, " %v fork_id NOT IN (%v)", filterOp, strings.Join(forkIdStr, ","))
-			filterOp = "AND"
-		}
-	}
+	appendWithOrphanedFilter(&sql, &args, &filterOp, filter.WithOrphaned, canonicalForkIds, "fork_id")
 
 	args = append(args, limit)
 	fmt.Fprintf(&sql, `) 
@@ -222,7 +204,7 @@ func GetWithdrawalRequestTxsFiltered(offset uint64, limit uint32, canonicalForkI
 	fmt.Fprintf(&sql, ") AS t1")
 
 	withdrawalRequestTxs := []*dbtypes.WithdrawalRequestTx{}
-	err := ReaderDb.Select(&withdrawalRequestTxs, sql.String(), args...)
+	err := ReaderDb.SelectContext(ctx, &withdrawalRequestTxs, sql.String(), args...)
 	if err != nil {
 		logger.Errorf("Error while fetching filtered withdrawal request txs: %v", err)
 		return nil, 0, err

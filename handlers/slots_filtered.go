@@ -1,14 +1,14 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/indexer/beacon"
@@ -16,6 +16,7 @@ import (
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
 	"github.com/ethpandaops/dora/utils"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -38,9 +39,9 @@ func SlotsFiltered(w http.ResponseWriter, r *http.Request) {
 	if urlArgs.Has("s") {
 		pageIdx, _ = strconv.ParseUint(urlArgs.Get("s"), 10, 64)
 	}
-	var displayColumns string = ""
+	var displayColumns uint64 = 0
 	if urlArgs.Has("d") {
-		displayColumns = urlArgs.Get("d")
+		displayColumns = utils.DecodeUint64BitfieldFromQuery(r.URL.RawQuery, "d")
 	}
 
 	var graffiti string
@@ -50,8 +51,8 @@ func SlotsFiltered(w http.ResponseWriter, r *http.Request) {
 	var invertgraffiti bool
 	var invertextradata bool
 	var invertproposer bool
-	var withOrphaned uint64
-	var withMissing uint64
+	var statusMask uint64 = 0x07
+	var payloadMask uint64 = 0x07
 	var minSyncAgg string
 	var maxSyncAgg string
 	var minExecTime string
@@ -61,6 +62,11 @@ func SlotsFiltered(w http.ResponseWriter, r *http.Request) {
 	var minBlobCount string
 	var maxBlobCount string
 	var forkIds string
+	var minSlot string
+	var maxSlot string
+	var builder string
+	var invertBuilder bool
+	var withBuilderBlock uint64
 
 	if urlArgs.Has("f") {
 		if urlArgs.Has("f.graffiti") {
@@ -84,11 +90,11 @@ func SlotsFiltered(w http.ResponseWriter, r *http.Request) {
 		if urlArgs.Has("f.pinvert") {
 			invertproposer = urlArgs.Get("f.pinvert") == "on"
 		}
-		if urlArgs.Has("f.orphaned") {
-			withOrphaned, _ = strconv.ParseUint(urlArgs.Get("f.orphaned"), 10, 64)
+		if urlArgs.Has("f.status") {
+			statusMask, _ = strconv.ParseUint(urlArgs.Get("f.status"), 0, 64)
 		}
-		if urlArgs.Has("f.missing") {
-			withMissing, _ = strconv.ParseUint(urlArgs.Get("f.missing"), 10, 64)
+		if urlArgs.Has("f.pstatus") {
+			payloadMask, _ = strconv.ParseUint(urlArgs.Get("f.pstatus"), 0, 64)
 		}
 		if urlArgs.Has("f.minsync") {
 			minSyncAgg = urlArgs.Get("f.minsync")
@@ -117,14 +123,26 @@ func SlotsFiltered(w http.ResponseWriter, r *http.Request) {
 		if urlArgs.Has("f.fork") {
 			forkIds = urlArgs.Get("f.fork")
 		}
-	} else {
-		withOrphaned = 1
-		withMissing = 1
+		if urlArgs.Has("f.minslot") {
+			minSlot = urlArgs.Get("f.minslot")
+		}
+		if urlArgs.Has("f.maxslot") {
+			maxSlot = urlArgs.Get("f.maxslot")
+		}
+		if urlArgs.Has("f.builder") {
+			builder = urlArgs.Get("f.builder")
+		}
+		if urlArgs.Has("f.binvert") {
+			invertBuilder = urlArgs.Get("f.binvert") == "on"
+		}
+		if urlArgs.Has("f.builderblock") {
+			withBuilderBlock, _ = strconv.ParseUint(urlArgs.Get("f.builderblock"), 10, 64)
+		}
 	}
 	var pageError error
 	pageError = services.GlobalCallRateLimiter.CheckCallLimit(r, 2)
 	if pageError == nil {
-		data.Data, pageError = getFilteredSlotsPageData(pageIdx, pageSize, graffiti, invertgraffiti, extradata, invertextradata, proposer, pname, invertproposer, uint8(withOrphaned), uint8(withMissing), minSyncAgg, maxSyncAgg, minExecTime, maxExecTime, minTxCount, maxTxCount, minBlobCount, maxBlobCount, forkIds, displayColumns)
+		data.Data, pageError = getFilteredSlotsPageData(pageIdx, pageSize, graffiti, invertgraffiti, extradata, invertextradata, proposer, pname, invertproposer, uint8(statusMask), uint8(payloadMask), minSyncAgg, maxSyncAgg, minExecTime, maxExecTime, minTxCount, maxTxCount, minBlobCount, maxBlobCount, forkIds, minSlot, maxSlot, builder, invertBuilder, uint8(withBuilderBlock), displayColumns)
 	}
 	if pageError != nil {
 		handlePageError(w, r, pageError)
@@ -136,11 +154,11 @@ func SlotsFiltered(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func getFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string, invertgraffiti bool, extradata string, invertextradata bool, proposer string, pname string, invertproposer bool, withOrphaned uint8, withMissing uint8, minSyncAgg string, maxSyncAgg string, minExecTime string, maxExecTime string, minTxCount string, maxTxCount string, minBlobCount string, maxBlobCount string, forkIds string, displayColumns string) (*models.SlotsFilteredPageData, error) {
+func getFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string, invertgraffiti bool, extradata string, invertextradata bool, proposer string, pname string, invertproposer bool, statusMask uint8, payloadMask uint8, minSyncAgg string, maxSyncAgg string, minExecTime string, maxExecTime string, minTxCount string, maxTxCount string, minBlobCount string, maxBlobCount string, forkIds string, minSlot string, maxSlot string, builder string, invertBuilder bool, withBuilderBlock uint8, displayColumns uint64) (*models.SlotsFilteredPageData, error) {
 	pageData := &models.SlotsFilteredPageData{}
-	pageCacheKey := fmt.Sprintf("slots_filtered:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v", pageIdx, pageSize, graffiti, invertgraffiti, extradata, invertextradata, proposer, pname, invertproposer, withOrphaned, withMissing, minSyncAgg, maxSyncAgg, minExecTime, maxExecTime, minTxCount, maxTxCount, minBlobCount, maxBlobCount, forkIds, displayColumns)
-	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(_ *services.FrontendCacheProcessingPage) interface{} {
-		return buildFilteredSlotsPageData(pageIdx, pageSize, graffiti, invertgraffiti, extradata, invertextradata, proposer, pname, invertproposer, withOrphaned, withMissing, minSyncAgg, maxSyncAgg, minExecTime, maxExecTime, minTxCount, maxTxCount, minBlobCount, maxBlobCount, forkIds, displayColumns)
+	pageCacheKey := fmt.Sprintf("slots_filtered:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v:%v", pageIdx, pageSize, graffiti, invertgraffiti, extradata, invertextradata, proposer, pname, invertproposer, statusMask, payloadMask, minSyncAgg, maxSyncAgg, minExecTime, maxExecTime, minTxCount, maxTxCount, minBlobCount, maxBlobCount, forkIds, minSlot, maxSlot, builder, invertBuilder, withBuilderBlock, displayColumns)
+	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
+		return buildFilteredSlotsPageData(pageCall.CallCtx, pageIdx, pageSize, graffiti, invertgraffiti, extradata, invertextradata, proposer, pname, invertproposer, statusMask, payloadMask, minSyncAgg, maxSyncAgg, minExecTime, maxExecTime, minTxCount, maxTxCount, minBlobCount, maxBlobCount, forkIds, minSlot, maxSlot, builder, invertBuilder, withBuilderBlock, displayColumns)
 	})
 	if pageErr == nil && pageRes != nil {
 		resData, resOk := pageRes.(*models.SlotsFilteredPageData)
@@ -152,8 +170,9 @@ func getFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string, 
 	return pageData, pageErr
 }
 
-func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string, invertgraffiti bool, extradata string, invertextradata bool, proposer string, pname string, invertproposer bool, withOrphaned uint8, withMissing uint8, minSyncAgg string, maxSyncAgg string, minExecTime string, maxExecTime string, minTxCount string, maxTxCount string, minBlobCount string, maxBlobCount string, forkIds string, displayColumns string) *models.SlotsFilteredPageData {
+func buildFilteredSlotsPageData(ctx context.Context, pageIdx uint64, pageSize uint64, graffiti string, invertgraffiti bool, extradata string, invertextradata bool, proposer string, pname string, invertproposer bool, statusMask uint8, payloadMask uint8, minSyncAgg string, maxSyncAgg string, minExecTime string, maxExecTime string, minTxCount string, maxTxCount string, minBlobCount string, maxBlobCount string, forkIds string, minSlot string, maxSlot string, builder string, invertBuilder bool, withBuilderBlock uint8, displayColumns uint64) *models.SlotsFilteredPageData {
 	chainState := services.GlobalBeaconService.GetChainState()
+	gloasActive := chainState.IsEip7732Enabled(chainState.EpochOfSlot(chainState.CurrentSlot()))
 	filterArgs := url.Values{}
 	if graffiti != "" {
 		filterArgs.Add("f.graffiti", graffiti)
@@ -176,11 +195,11 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 	if invertproposer {
 		filterArgs.Add("f.pinvert", "on")
 	}
-	if withOrphaned != 0 {
-		filterArgs.Add("f.orphaned", fmt.Sprintf("%v", withOrphaned))
+	if statusMask != 0x07 {
+		filterArgs.Add("f.status", fmt.Sprintf("0x%x", statusMask))
 	}
-	if withMissing != 0 {
-		filterArgs.Add("f.missing", fmt.Sprintf("%v", withMissing))
+	if payloadMask != 0x07 {
+		filterArgs.Add("f.pstatus", fmt.Sprintf("0x%x", payloadMask))
 	}
 	if minSyncAgg != "" {
 		filterArgs.Add("f.minsync", minSyncAgg)
@@ -209,6 +228,21 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 	if forkIds != "" {
 		filterArgs.Add("f.fork", forkIds)
 	}
+	if minSlot != "" {
+		filterArgs.Add("f.minslot", minSlot)
+	}
+	if maxSlot != "" {
+		filterArgs.Add("f.maxslot", maxSlot)
+	}
+	if builder != "" {
+		filterArgs.Add("f.builder", builder)
+	}
+	if invertBuilder {
+		filterArgs.Add("f.binvert", "on")
+	}
+	if withBuilderBlock != 0 {
+		filterArgs.Add("f.builderblock", fmt.Sprintf("%v", withBuilderBlock))
+	}
 
 	// Check if snooper clients are configured
 	hasSnooperClients := false
@@ -217,17 +251,14 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 	}
 
 	displayMap := map[uint64]bool{}
-	if displayColumns != "" {
-		for _, col := range strings.Split(displayColumns, " ") {
-			colNum, err := strconv.ParseUint(col, 10, 64)
-			if err != nil {
-				continue
+	if displayColumns != 0 {
+		for i := 0; i < 64; i++ {
+			if displayColumns&(1<<i) != 0 {
+				displayMap[uint64(i+1)] = true
 			}
-			displayMap[colNum] = true
 		}
 	}
 	if len(displayMap) == 0 {
-
 		displayMap = map[uint64]bool{
 			1:  true,
 			2:  true,
@@ -247,43 +278,70 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 			16: false,
 			17: !hasSnooperClients, // Disable receive delay if snooper clients exist
 			18: hasSnooperClients,  // Enable exec time if snooper clients exist
+			19: false,              // Builder (opt-in; proposer column already shows build source)
 		}
 	} else {
-		displayList := make([]uint64, len(displayMap))
-		displayIdx := 0
+		displayMask := uint64(0)
 		for col := range displayMap {
-			displayList[displayIdx] = col
-			displayIdx++
+			if col == 0 || col > 64 {
+				continue
+			}
+			displayMask |= 1 << (col - 1)
 		}
-		sort.Slice(displayList, func(a, b int) bool {
-			return displayList[a] < displayList[b]
-		})
-		displayStr := make([]string, len(displayMap))
-		for idx, col := range displayList {
-			displayStr[idx] = fmt.Sprintf("%v", col)
-		}
-		filterArgs.Add("d", strings.Join(displayStr, " "))
+		filterArgs.Add("d", fmt.Sprintf("0x%x", displayMask))
+	}
+
+	// Map statusMask to WithOrphaned/WithMissing for DB filter
+	hasMissing := statusMask&0x01 != 0
+	hasCanonical := statusMask&0x02 != 0
+	hasOrphaned := statusMask&0x04 != 0
+
+	var withMissing, withOrphaned uint8
+	if !hasMissing {
+		withMissing = 0
+	} else if !hasCanonical && !hasOrphaned {
+		withMissing = 2
+	} else {
+		withMissing = 1
+	}
+	if !hasOrphaned {
+		withOrphaned = 0
+	} else if !hasCanonical && !hasMissing {
+		withOrphaned = 2
+	} else {
+		withOrphaned = 1
 	}
 
 	pageData := &models.SlotsFilteredPageData{
-		FilterGraffiti:        graffiti,
-		FilterExtraData:       extradata,
-		FilterProposer:        proposer,
-		FilterProposerName:    pname,
-		FilterInvertGraffiti:  invertgraffiti,
-		FilterInvertExtraData: invertextradata,
-		FilterInvertProposer:  invertproposer,
-		FilterWithOrphaned:    withOrphaned,
-		FilterWithMissing:     withMissing,
-		FilterMinSyncAgg:      minSyncAgg,
-		FilterMaxSyncAgg:      maxSyncAgg,
-		FilterMinExecTime:     minExecTime,
-		FilterMaxExecTime:     maxExecTime,
-		FilterMinTxCount:      minTxCount,
-		FilterMaxTxCount:      maxTxCount,
-		FilterMinBlobCount:    minBlobCount,
-		FilterMaxBlobCount:    maxBlobCount,
-		FilterForkIds:         forkIds,
+		FilterGraffiti:         graffiti,
+		FilterExtraData:        extradata,
+		FilterProposer:         proposer,
+		FilterProposerName:     pname,
+		FilterInvertGraffiti:   invertgraffiti,
+		FilterInvertExtraData:  invertextradata,
+		FilterInvertProposer:   invertproposer,
+		FilterStatusMissing:    hasMissing,
+		FilterStatusCanonical:  hasCanonical,
+		FilterStatusOrphaned:   hasOrphaned,
+		FilterPayloadMissing:   payloadMask&0x01 != 0,
+		FilterPayloadCanonical: payloadMask&0x02 != 0,
+		FilterPayloadOrphaned:  payloadMask&0x04 != 0,
+		FilterMinSyncAgg:       minSyncAgg,
+		FilterMaxSyncAgg:       maxSyncAgg,
+		FilterMinExecTime:      minExecTime,
+		FilterMaxExecTime:      maxExecTime,
+		FilterMinTxCount:       minTxCount,
+		FilterMaxTxCount:       maxTxCount,
+		FilterMinBlobCount:     minBlobCount,
+		FilterMaxBlobCount:     maxBlobCount,
+		FilterForkIds:          forkIds,
+		FilterMinSlot:          minSlot,
+		FilterMaxSlot:          maxSlot,
+		FilterBuilder:          builder,
+		FilterInvertBuilder:    invertBuilder,
+		FilterWithBuilder:      withBuilderBlock,
+
+		IsGloasActive: gloasActive,
 
 		DisplayEpoch:        displayMap[1],
 		DisplaySlot:         displayMap[2],
@@ -303,6 +361,7 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 		DisplayBlockSize:    displayMap[16],
 		DisplayRecvDelay:    displayMap[17],
 		DisplayExecTime:     displayMap[18],
+		DisplayBuilder:      displayMap[19],
 		DisplayColCount:     uint64(len(displayMap)),
 
 		HasSnooperClients: hasSnooperClients,
@@ -331,14 +390,16 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 	// load slots
 	pageData.Slots = make([]*models.SlotsFilteredPageDataSlot, 0)
 	blockFilter := &dbtypes.BlockFilter{
-		Graffiti:        graffiti,
-		ExtraData:       extradata,
-		ProposerName:    pname,
-		InvertGraffiti:  invertgraffiti,
-		InvertExtraData: invertextradata,
-		InvertProposer:  invertproposer,
-		WithOrphaned:    withOrphaned,
-		WithMissing:     withMissing,
+		Graffiti:         graffiti,
+		ExtraData:        extradata,
+		ProposerName:     pname,
+		InvertGraffiti:   invertgraffiti,
+		InvertExtraData:  invertextradata,
+		InvertProposer:   invertproposer,
+		WithOrphaned:     withOrphaned,
+		WithMissing:      withMissing,
+		WithPayloadMask:  dbtypes.PayloadStatusMask(payloadMask),
+		WithBuilderBlock: withBuilderBlock,
 	}
 	if proposer != "" {
 		pidx, _ := strconv.ParseUint(proposer, 10, 64)
@@ -416,13 +477,27 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 			blockFilter.ForkIds = parsedForkIds
 		}
 	}
-
-	withScheduledCount := chainState.GetSpecs().SlotsPerEpoch - uint64(chainState.SlotToSlotIndex(currentSlot)) - 1
-	if withScheduledCount > 16 {
-		withScheduledCount = 16
+	if minSlot != "" {
+		minSl, err := strconv.ParseUint(minSlot, 10, 64)
+		if err == nil {
+			blockFilter.MinSlot = &minSl
+		}
+	}
+	if maxSlot != "" {
+		maxSl, err := strconv.ParseUint(maxSlot, 10, 64)
+		if err == nil {
+			blockFilter.MaxSlot = &maxSl
+		}
+	}
+	if builder != "" {
+		builderIdx, err := strconv.ParseInt(builder, 10, 64)
+		if err == nil {
+			blockFilter.BuilderIndex = &builderIdx
+			blockFilter.InvertBuilder = invertBuilder
+		}
 	}
 
-	dbBlocks := services.GlobalBeaconService.GetDbBlocksByFilter(blockFilter, pageIdx, uint32(pageSize), withScheduledCount)
+	dbBlocks := services.GlobalBeaconService.GetDbBlocksByFilter(ctx, blockFilter, pageIdx, uint32(pageSize), 16)
 	mevBlocksMap := make(map[string]*dbtypes.MevBlock)
 
 	if pageData.DisplayMevBlock {
@@ -435,7 +510,7 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 		}
 
 		if len(execBlockHashes) > 0 {
-			mevBlocksMap = db.GetMevBlocksByBlockHashes(execBlockHashes)
+			mevBlocksMap = db.GetMevBlocksByBlockHashes(ctx, execBlockHashes)
 		}
 	}
 
@@ -446,12 +521,13 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 			break
 		}
 		slot := phase0.Slot(dbBlock.Slot)
+		epoch := chainState.EpochOfSlot(slot)
 
 		slotData := &models.SlotsFilteredPageDataSlot{
 			Slot:         uint64(slot),
-			Epoch:        uint64(chainState.EpochOfSlot(slot)),
+			Epoch:        uint64(epoch),
 			Ts:           chainState.SlotToTime(slot),
-			Finalized:    finalizedEpoch >= chainState.EpochOfSlot(slot),
+			Finalized:    finalizedEpoch >= epoch,
 			Synchronized: true,
 			Scheduled:    slot >= currentSlot,
 			Proposer:     dbBlock.Proposer,
@@ -483,6 +559,12 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 				slotData.EthBlockNumber = *dbBlock.Block.EthBlockNumber
 			}
 
+			payloadStatus := dbBlock.Block.PayloadStatus
+			if !chainState.IsEip7732Enabled(epoch) {
+				payloadStatus = dbtypes.PayloadStatusCanonical
+			}
+			slotData.PayloadStatus = uint8(payloadStatus)
+
 			if pageData.DisplayMevBlock && dbBlock.Block.EthBlockHash != nil {
 				if mevBlock, exists := mevBlocksMap[fmt.Sprintf("%x", dbBlock.Block.EthBlockHash)]; exists {
 					slotData.IsMevBlock = true
@@ -495,6 +577,19 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 						}
 					}
 					slotData.MevBlockRelays = strings.Join(relays, ", ")
+				}
+			}
+
+			// Add builder info (needed for the Builder column and the proposer build-source icon)
+			if pageData.DisplayBuilder || pageData.DisplayProposer {
+				if dbBlock.Block.BuilderIndex == -1 {
+					slotData.HasBuilder = true
+					slotData.BuilderIndex = math.MaxUint64 // Self-built sentinel
+				} else if dbBlock.Block.BuilderIndex >= 0 {
+					slotData.HasBuilder = true
+					slotData.BuilderIndex = uint64(dbBlock.Block.BuilderIndex)
+					slotData.BuilderName = services.GlobalBeaconService.GetValidatorName(uint64(dbBlock.Block.BuilderIndex) | services.BuilderIndexFlag)
+					slotData.BuilderURL = services.GlobalBeaconService.GetBuilderURL(uint64(dbBlock.Block.BuilderIndex))
 				}
 			}
 
@@ -550,13 +645,13 @@ func buildFilteredSlotsPageData(pageIdx uint64, pageSize uint64, graffiti string
 	}
 
 	// Populate UrlParams for page jump functionality
-	pageData.UrlParams = make(map[string]string)
+	pageData.UrlParams = make([]models.UrlParam, 0)
 	for key, values := range filterArgs {
 		if len(values) > 0 {
-			pageData.UrlParams[key] = values[0]
+			pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{Key: key, Value: values[0]})
 		}
 	}
-	pageData.UrlParams["c"] = fmt.Sprintf("%v", pageData.PageSize)
+	pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{Key: "c", Value: fmt.Sprintf("%v", pageData.PageSize)})
 
 	pageData.FirstPageLink = fmt.Sprintf("/slots/filtered?f&%v&c=%v", filterArgs.Encode(), pageData.PageSize)
 	pageData.PrevPageLink = fmt.Sprintf("/slots/filtered?f&%v&c=%v&s=%v", filterArgs.Encode(), pageData.PageSize, pageData.PrevPageSlot)

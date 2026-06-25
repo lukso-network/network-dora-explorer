@@ -8,10 +8,10 @@ import (
 	"strconv"
 	"strings"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/utils"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
 	"github.com/sirupsen/logrus"
 )
 
@@ -198,7 +198,7 @@ func APIValidatorsV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get validators from service
-	validatorSet, validatorSetLen := services.GlobalBeaconService.GetFilteredValidatorSet(&validatorFilter, true)
+	validatorSet, validatorSetLen := services.GlobalBeaconService.GetFilteredValidatorSet(r.Context(), &validatorFilter, true)
 
 	var validators []*APIValidatorInfo
 	for _, validator := range validatorSet {

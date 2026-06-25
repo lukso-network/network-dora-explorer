@@ -1,12 +1,13 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 
@@ -58,7 +59,7 @@ func getValidatorSlotsPageData(validator uint64, pageIdx uint64, pageSize uint64
 	pageData := &models.ValidatorSlotsPageData{}
 	pageCacheKey := fmt.Sprintf("valslots:%v:%v:%v", validator, pageIdx, pageSize)
 	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
-		pageData, cacheTimeout := buildValidatorSlotsPageData(validator, pageIdx, pageSize)
+		pageData, cacheTimeout := buildValidatorSlotsPageData(pageCall.CallCtx, validator, pageIdx, pageSize)
 		pageCall.CacheTimeout = cacheTimeout
 		return pageData
 	})
@@ -72,7 +73,7 @@ func getValidatorSlotsPageData(validator uint64, pageIdx uint64, pageSize uint64
 	return pageData, pageErr
 }
 
-func buildValidatorSlotsPageData(validator uint64, pageIdx uint64, pageSize uint64) (*models.ValidatorSlotsPageData, time.Duration) {
+func buildValidatorSlotsPageData(ctx context.Context, validator uint64, pageIdx uint64, pageSize uint64) (*models.ValidatorSlotsPageData, time.Duration) {
 	pageData := &models.ValidatorSlotsPageData{
 		Index: validator,
 		Name:  services.GlobalBeaconService.GetValidatorName(validator),
@@ -100,7 +101,7 @@ func buildValidatorSlotsPageData(validator uint64, pageIdx uint64, pageSize uint
 
 	// load slots
 	pageData.Slots = make([]*models.ValidatorSlotsPageDataSlot, 0)
-	dbBlocks := services.GlobalBeaconService.GetDbBlocksByFilter(&dbtypes.BlockFilter{
+	dbBlocks := services.GlobalBeaconService.GetDbBlocksByFilter(ctx, &dbtypes.BlockFilter{
 		ProposerIndex: &validator,
 		WithOrphaned:  1,
 		WithMissing:   1,
@@ -112,12 +113,13 @@ func buildValidatorSlotsPageData(validator uint64, pageIdx uint64, pageSize uint
 			break
 		}
 		slot := blockAssignment.Slot
+		epoch := chainState.EpochOfSlot(phase0.Slot(slot))
 
 		slotData := &models.ValidatorSlotsPageDataSlot{
 			Slot:         slot,
-			Epoch:        uint64(chainState.EpochOfSlot(phase0.Slot(slot))),
+			Epoch:        uint64(epoch),
 			Ts:           chainState.SlotToTime(phase0.Slot(slot)),
-			Finalized:    finalizedEpoch >= chainState.EpochOfSlot(phase0.Slot(slot)),
+			Finalized:    finalizedEpoch >= epoch,
 			Status:       uint8(0),
 			Proposer:     validator,
 			ProposerName: pageData.Name,
@@ -140,6 +142,12 @@ func buildValidatorSlotsPageData(validator uint64, pageIdx uint64, pageSize uint
 				slotData.WithEthBlock = true
 				slotData.EthBlockNumber = *dbBlock.EthBlockNumber
 			}
+
+			payloadStatus := dbBlock.PayloadStatus
+			if !chainState.IsEip7732Enabled(epoch) {
+				payloadStatus = dbtypes.PayloadStatusCanonical
+			}
+			slotData.PayloadStatus = uint8(payloadStatus)
 		}
 		pageData.Slots = append(pageData.Slots, slotData)
 	}

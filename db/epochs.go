@@ -1,19 +1,21 @@
 package db
 
 import (
+	"context"
+
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/jmoiron/sqlx"
 )
 
-func InsertEpoch(epoch *dbtypes.Epoch, tx *sqlx.Tx) error {
-	_, err := tx.Exec(EngineQuery(map[dbtypes.DBEngineType]string{
+func InsertEpoch(ctx context.Context, tx *sqlx.Tx, epoch *dbtypes.Epoch) error {
+	_, err := tx.ExecContext(ctx, EngineQuery(map[dbtypes.DBEngineType]string{
 		dbtypes.DBEnginePgsql: `
 			INSERT INTO epochs (
 				epoch, validator_count, validator_balance, eligible, voted_target, voted_head, voted_total, block_count, orphaned_count,
 				attestation_count, deposit_count, exit_count, withdraw_count, withdraw_amount, attester_slashing_count, 
 				proposer_slashing_count, bls_change_count, eth_transaction_count, sync_participation, blob_count,
-				eth_gas_used, eth_gas_limit
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+				eth_gas_used, eth_gas_limit, payload_count
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 			ON CONFLICT (epoch) DO UPDATE SET
 				validator_count = excluded.validator_count,
 				validator_balance = excluded.validator_balance,
@@ -35,41 +37,52 @@ func InsertEpoch(epoch *dbtypes.Epoch, tx *sqlx.Tx) error {
 				sync_participation = excluded.sync_participation,
 				blob_count = excluded.blob_count,
 				eth_gas_used = excluded.eth_gas_used,
-				eth_gas_limit = excluded.eth_gas_limit`,
+				eth_gas_limit = excluded.eth_gas_limit,
+				payload_count = excluded.payload_count`,
 		dbtypes.DBEngineSqlite: `
 			INSERT OR REPLACE INTO epochs (
 				epoch, validator_count, validator_balance, eligible, voted_target, voted_head, voted_total, block_count, orphaned_count,
 				attestation_count, deposit_count, exit_count, withdraw_count, withdraw_amount, attester_slashing_count, 
 				proposer_slashing_count, bls_change_count, eth_transaction_count, sync_participation, blob_count,
-				eth_gas_used, eth_gas_limit
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`,
+				eth_gas_used, eth_gas_limit, payload_count
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`,
 	}),
 		epoch.Epoch, epoch.ValidatorCount, epoch.ValidatorBalance, epoch.Eligible, epoch.VotedTarget, epoch.VotedHead, epoch.VotedTotal, epoch.BlockCount, epoch.OrphanedCount,
 		epoch.AttestationCount, epoch.DepositCount, epoch.ExitCount, epoch.WithdrawCount, epoch.WithdrawAmount, epoch.AttesterSlashingCount, epoch.ProposerSlashingCount,
-		epoch.BLSChangeCount, epoch.EthTransactionCount, epoch.SyncParticipation, epoch.BlobCount, epoch.EthGasUsed, epoch.EthGasLimit)
+		epoch.BLSChangeCount, epoch.EthTransactionCount, epoch.SyncParticipation, epoch.BlobCount, epoch.EthGasUsed, epoch.EthGasLimit, epoch.PayloadCount)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func IsEpochSynchronized(epoch uint64) bool {
+// UpdateEpochDutiesSize records the stored size of an epoch's duties object.
+func UpdateEpochDutiesSize(ctx context.Context, epoch uint64, size uint64) error {
+	return RunDBTransaction(func(tx *sqlx.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE epochs SET block_duties_size = $1 WHERE epoch = $2`,
+			size, epoch)
+		return err
+	})
+}
+
+func IsEpochSynchronized(ctx context.Context, epoch uint64) bool {
 	var count uint64
-	err := ReaderDb.Get(&count, `SELECT COUNT(*) FROM epochs WHERE epoch = $1`, epoch)
+	err := ReaderDb.GetContext(ctx, &count, `SELECT COUNT(*) FROM epochs WHERE epoch = $1`, epoch)
 	if err != nil {
 		return false
 	}
 	return count > 0
 }
 
-func GetEpochs(firstEpoch uint64, limit uint32) []*dbtypes.Epoch {
+func GetEpochs(ctx context.Context, firstEpoch uint64, limit uint32) []*dbtypes.Epoch {
 	epochs := []*dbtypes.Epoch{}
-	err := ReaderDb.Select(&epochs, `
+	err := ReaderDb.SelectContext(ctx, &epochs, `
 	SELECT
 		epoch, validator_count, validator_balance, eligible, voted_target, voted_head, voted_total, block_count, orphaned_count,
 		attestation_count, deposit_count, exit_count, withdraw_count, withdraw_amount, attester_slashing_count,
 		proposer_slashing_count, bls_change_count, eth_transaction_count, sync_participation, blob_count,
-		eth_gas_used, eth_gas_limit
+		eth_gas_used, eth_gas_limit, payload_count
 	FROM epochs
 	WHERE epoch <= $1
 	ORDER BY epoch DESC
@@ -93,10 +106,10 @@ type EpochParticipation struct {
 }
 
 // GetFinalizedEpochParticipation gets participation data for finalized canonical epochs in the given range
-func GetFinalizedEpochParticipation(startEpoch, endEpoch uint64) ([]*EpochParticipation, error) {
+func GetFinalizedEpochParticipation(ctx context.Context, startEpoch, endEpoch uint64) ([]*EpochParticipation, error) {
 	var results []*EpochParticipation
 
-	err := ReaderDb.Select(&results, `
+	err := ReaderDb.SelectContext(ctx, &results, `
 		SELECT 
 			epoch,
 			block_count,

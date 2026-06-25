@@ -1,24 +1,25 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/dbtypes"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/jmoiron/sqlx"
 )
 
 // InsertValidator inserts a single validator into the database
-func InsertValidator(validator *dbtypes.Validator, tx *sqlx.Tx) error {
-	_, err := tx.Exec(EngineQuery(map[dbtypes.DBEngineType]string{
+func InsertValidator(ctx context.Context, tx *sqlx.Tx, validator *dbtypes.Validator) error {
+	_, err := tx.ExecContext(ctx, EngineQuery(map[dbtypes.DBEngineType]string{
 		dbtypes.DBEnginePgsql: `
 			INSERT INTO validators (
 				validator_index, pubkey, withdrawal_credentials, effective_balance,
 				slashed, activation_eligibility_epoch, activation_epoch,
-				exit_epoch, withdrawable_epoch
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				exit_epoch, withdrawable_epoch, cred_type
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			ON CONFLICT (validator_index) DO UPDATE SET
 				withdrawal_credentials = excluded.withdrawal_credentials,
 				effective_balance = excluded.effective_balance,
@@ -26,13 +27,14 @@ func InsertValidator(validator *dbtypes.Validator, tx *sqlx.Tx) error {
 				activation_eligibility_epoch = excluded.activation_eligibility_epoch,
 				activation_epoch = excluded.activation_epoch,
 				exit_epoch = excluded.exit_epoch,
-				withdrawable_epoch = excluded.withdrawable_epoch`,
+				withdrawable_epoch = excluded.withdrawable_epoch,
+				cred_type = excluded.cred_type`,
 		dbtypes.DBEngineSqlite: `
 			INSERT OR REPLACE INTO validators (
 				validator_index, pubkey, withdrawal_credentials, effective_balance,
 				slashed, activation_eligibility_epoch, activation_epoch,
-				exit_epoch, withdrawable_epoch
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				exit_epoch, withdrawable_epoch, cred_type
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 	}),
 		validator.ValidatorIndex,
 		validator.Pubkey,
@@ -42,7 +44,8 @@ func InsertValidator(validator *dbtypes.Validator, tx *sqlx.Tx) error {
 		validator.ActivationEligibilityEpoch,
 		validator.ActivationEpoch,
 		validator.ExitEpoch,
-		validator.WithdrawableEpoch)
+		validator.WithdrawableEpoch,
+		validator.CredType)
 
 	if err != nil {
 		return fmt.Errorf("error inserting validator: %v", err)
@@ -51,26 +54,31 @@ func InsertValidator(validator *dbtypes.Validator, tx *sqlx.Tx) error {
 }
 
 // InsertValidatorBatch inserts multiple validators in a batch
-func InsertValidatorBatch(validators []*dbtypes.Validator, tx *sqlx.Tx) error {
+func InsertValidatorBatch(ctx context.Context, tx *sqlx.Tx, validators []*dbtypes.Validator) error {
 	if len(validators) == 0 {
 		return nil
 	}
 
-	valueStrings := make([]string, len(validators))
-	valueArgs := make([]interface{}, 0, len(validators)*9)
-	for i, val := range validators {
-		valueStrings[i] = fmt.Sprintf("($%v, $%v, $%v, $%v, $%v, $%v, $%v, $%v, $%v)",
-			i*9+1, i*9+2, i*9+3, i*9+4, i*9+5, i*9+6, i*9+7, i*9+8, i*9+9)
+	valueArgs := make([]interface{}, 0, len(validators)*10)
+	var values strings.Builder
+	for i, validator := range validators {
+		if i > 0 {
+			values.WriteByte(',')
+		}
+		values.WriteByte('(')
+		appendDollarPlaceholders(&values, i*10+1, 10, ", ")
+		values.WriteByte(')')
 		valueArgs = append(valueArgs,
-			val.ValidatorIndex,
-			val.Pubkey,
-			val.WithdrawalCredentials,
-			val.EffectiveBalance,
-			val.Slashed,
-			val.ActivationEligibilityEpoch,
-			val.ActivationEpoch,
-			val.ExitEpoch,
-			val.WithdrawableEpoch)
+			validator.ValidatorIndex,
+			validator.Pubkey,
+			validator.WithdrawalCredentials,
+			validator.EffectiveBalance,
+			validator.Slashed,
+			validator.ActivationEligibilityEpoch,
+			validator.ActivationEpoch,
+			validator.ExitEpoch,
+			validator.WithdrawableEpoch,
+			validator.CredType)
 	}
 
 	stmt := fmt.Sprintf(EngineQuery(map[dbtypes.DBEngineType]string{
@@ -78,7 +86,7 @@ func InsertValidatorBatch(validators []*dbtypes.Validator, tx *sqlx.Tx) error {
 			INSERT INTO validators (
 				validator_index, pubkey, withdrawal_credentials, effective_balance,
 				slashed, activation_eligibility_epoch, activation_epoch,
-				exit_epoch, withdrawable_epoch
+				exit_epoch, withdrawable_epoch, cred_type
 			) VALUES %s
 			ON CONFLICT (validator_index) DO UPDATE SET
 				withdrawal_credentials = excluded.withdrawal_credentials,
@@ -87,16 +95,17 @@ func InsertValidatorBatch(validators []*dbtypes.Validator, tx *sqlx.Tx) error {
 				activation_eligibility_epoch = excluded.activation_eligibility_epoch,
 				activation_epoch = excluded.activation_epoch,
 				exit_epoch = excluded.exit_epoch,
-				withdrawable_epoch = excluded.withdrawable_epoch`,
+				withdrawable_epoch = excluded.withdrawable_epoch,
+				cred_type = excluded.cred_type`,
 		dbtypes.DBEngineSqlite: `
 			INSERT OR REPLACE INTO validators (
 				validator_index, pubkey, withdrawal_credentials, effective_balance,
 				slashed, activation_eligibility_epoch, activation_epoch,
-				exit_epoch, withdrawable_epoch
+				exit_epoch, withdrawable_epoch, cred_type
 			) VALUES %s`,
-	}), strings.Join(valueStrings, ","))
+	}), values.String())
 
-	_, err := tx.Exec(stmt, valueArgs...)
+	_, err := tx.ExecContext(ctx, stmt, valueArgs...)
 	if err != nil {
 		return fmt.Errorf("error inserting validator batch: %v", err)
 	}
@@ -105,9 +114,9 @@ func InsertValidatorBatch(validators []*dbtypes.Validator, tx *sqlx.Tx) error {
 }
 
 // GetValidatorByIndex returns a validator by index
-func GetValidatorByIndex(index phase0.ValidatorIndex) *dbtypes.Validator {
+func GetValidatorByIndex(ctx context.Context, index phase0.ValidatorIndex) *dbtypes.Validator {
 	validator := dbtypes.Validator{}
-	err := ReaderDb.Get(&validator, `
+	err := ReaderDb.GetContext(ctx, &validator, `
 		SELECT * FROM validators WHERE validator_index = $1
 	`, index)
 	if err != nil {
@@ -117,9 +126,9 @@ func GetValidatorByIndex(index phase0.ValidatorIndex) *dbtypes.Validator {
 }
 
 // GetValidatorByPubkey returns a validator by pubkey
-func GetValidatorByPubkey(pubkey []byte) *dbtypes.Validator {
+func GetValidatorByPubkey(ctx context.Context, pubkey []byte) *dbtypes.Validator {
 	validator := dbtypes.Validator{}
-	err := ReaderDb.Get(&validator, `
+	err := ReaderDb.GetContext(ctx, &validator, `
 		SELECT * FROM validators WHERE pubkey = $1
 	`, pubkey)
 	if err != nil {
@@ -129,9 +138,9 @@ func GetValidatorByPubkey(pubkey []byte) *dbtypes.Validator {
 }
 
 // GetValidatorRange returns validators in a given index range
-func GetValidatorRange(startIndex uint64, endIndex uint64) []*dbtypes.Validator {
+func GetValidatorRange(ctx context.Context, startIndex uint64, endIndex uint64) []*dbtypes.Validator {
 	validators := []*dbtypes.Validator{}
-	err := ReaderDb.Select(&validators, `
+	err := ReaderDb.SelectContext(ctx, &validators, `
 		SELECT * FROM validators 
 		WHERE validator_index >= $1 AND validator_index <= $2
 		ORDER BY validator_index ASC
@@ -144,9 +153,9 @@ func GetValidatorRange(startIndex uint64, endIndex uint64) []*dbtypes.Validator 
 }
 
 // GetMaxValidatorIndex returns the highest validator index in the database
-func GetMaxValidatorIndex() (uint64, error) {
+func GetMaxValidatorIndex(ctx context.Context) (uint64, error) {
 	var maxIndex uint64
-	err := ReaderDb.Get(&maxIndex, "SELECT COALESCE(MAX(validator_index), 0) FROM validators")
+	err := ReaderDb.GetContext(ctx, &maxIndex, "SELECT COALESCE(MAX(validator_index), 0) FROM validators")
 	if err != nil {
 		return 0, fmt.Errorf("error getting max validator index: %v", err)
 	}
@@ -154,7 +163,7 @@ func GetMaxValidatorIndex() (uint64, error) {
 }
 
 // GetValidatorIndexesByFilter returns validator indexes matching a filter
-func GetValidatorIndexesByFilter(filter dbtypes.ValidatorFilter, currentEpoch uint64) ([]uint64, error) {
+func GetValidatorIndexesByFilter(ctx context.Context, filter dbtypes.ValidatorFilter, currentEpoch uint64) ([]uint64, error) {
 	var sql strings.Builder
 	args := []interface{}{}
 	fmt.Fprint(&sql, `
@@ -193,7 +202,7 @@ func GetValidatorIndexesByFilter(filter dbtypes.ValidatorFilter, currentEpoch ui
 	}
 
 	validatorIds := []uint64{}
-	err := ReaderDb.Select(&validatorIds, sql.String(), args...)
+	err := ReaderDb.SelectContext(ctx, &validatorIds, sql.String(), args...)
 	if err != nil {
 		logger.Errorf("Error while fetching validators by filter: %v", err)
 		return nil, err
@@ -219,12 +228,12 @@ func buildValidatorFilterSql(filter dbtypes.ValidatorFilter, currentEpoch uint64
 		filterOp = "AND"
 	}
 	if len(filter.Indices) > 0 {
-		indices := []string{}
 		for _, index := range filter.Indices {
 			args = append(args, index)
-			indices = append(indices, fmt.Sprintf("$%v", len(args)))
 		}
-		fmt.Fprintf(sql, " %v validator_index IN (%s)", filterOp, strings.Join(indices, ","))
+		fmt.Fprintf(sql, " %v validator_index IN (", filterOp)
+		appendDollarPlaceholders(sql, len(args)-len(filter.Indices)+1, len(filter.Indices), ",")
+		fmt.Fprint(sql, ")")
 		filterOp = "AND"
 	}
 	if len(filter.PubKey) > 0 {
@@ -259,6 +268,18 @@ func buildValidatorFilterSql(filter dbtypes.ValidatorFilter, currentEpoch uint64
 		fmt.Fprintf(sql, " %v withdrawal_credentials = $%v", filterOp, len(args))
 		filterOp = "AND"
 	}
+	if len(filter.WithdrawalCredTypes) > 0 {
+		fmt.Fprintf(sql, " %v cred_type IN (", filterOp)
+		for i, credType := range filter.WithdrawalCredTypes {
+			if i > 0 {
+				fmt.Fprintf(sql, ", ")
+			}
+			args = append(args, uint16(credType))
+			fmt.Fprintf(sql, "$%v", len(args))
+		}
+		fmt.Fprintf(sql, ")")
+		filterOp = "AND"
+	}
 	if filter.ValidatorName != "" {
 		args = append(args, "%"+filter.ValidatorName+"%")
 		fmt.Fprintf(sql, EngineQuery(map[dbtypes.DBEngineType]string{
@@ -268,12 +289,12 @@ func buildValidatorFilterSql(filter dbtypes.ValidatorFilter, currentEpoch uint64
 		filterOp = "AND"
 	}
 	if len(filter.Status) > 0 {
-		values := []string{}
 		for _, status := range filter.Status {
 			args = append(args, status)
-			values = append(values, fmt.Sprintf("$%v", len(args)))
 		}
-		fmt.Fprintf(sql, " %v %v IN (%s)", filterOp, buildValidatorStatusSql(currentEpoch), strings.Join(values, ","))
+		fmt.Fprintf(sql, " %v %v IN (", filterOp, buildValidatorStatusSql(currentEpoch))
+		appendDollarPlaceholders(sql, len(args)-len(filter.Status)+1, len(filter.Status), ",")
+		fmt.Fprint(sql, ")")
 		filterOp = "AND"
 	}
 
@@ -294,7 +315,7 @@ func buildValidatorStatusSql(currentEpoch uint64) string {
 	`, math.MaxInt64, ConvertUint64ToInt64(currentEpoch), math.MaxInt64, ConvertUint64ToInt64(currentEpoch), ConvertUint64ToInt64(currentEpoch))
 }
 
-func StreamValidatorsByIndexes(indexes []uint64, cb func(validator *dbtypes.Validator) bool) error {
+func StreamValidatorsByIndexes(ctx context.Context, indexes []uint64, cb func(validator *dbtypes.Validator) bool) error {
 	const batchSize = 1000
 
 	// Process in batches
@@ -316,12 +337,9 @@ func StreamValidatorsByIndexes(indexes []uint64, cb func(validator *dbtypes.Vali
 
 		args := make([]any, len(batch))
 		for j, index := range batch {
-			if j > 0 {
-				fmt.Fprintf(&sql, ", ")
-			}
-			fmt.Fprintf(&sql, "$%v", j+1)
 			args[j] = index
 		}
+		appendDollarPlaceholders(&sql, 1, len(batch), ", ")
 		fmt.Fprintf(&sql, ")")
 
 		// Create index map for ordering
@@ -332,7 +350,7 @@ func StreamValidatorsByIndexes(indexes []uint64, cb func(validator *dbtypes.Vali
 
 		// Fetch all validators for this batch
 		validators := make([]*dbtypes.Validator, len(batch))
-		rows, err := ReaderDb.Query(sql.String(), args...)
+		rows, err := ReaderDb.QueryContext(ctx, sql.String(), args...)
 		if err != nil {
 			return fmt.Errorf("error querying validators: %v", err)
 		}

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -9,18 +10,18 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-func InsertDeposits(deposits []*dbtypes.Deposit, tx *sqlx.Tx) error {
+func InsertDeposits(ctx context.Context, tx *sqlx.Tx, deposits []*dbtypes.Deposit) error {
 	var sql strings.Builder
 	fmt.Fprint(&sql,
 		EngineQuery(map[dbtypes.DBEngineType]string{
 			dbtypes.DBEnginePgsql:  "INSERT INTO deposits ",
 			dbtypes.DBEngineSqlite: "INSERT OR REPLACE INTO deposits ",
 		}),
-		"(deposit_index, slot_number, slot_index, slot_root, orphaned, publickey, withdrawalcredentials, amount, fork_id)",
+		"(deposit_index, slot_number, slot_index, slot_root, orphaned, publickey, withdrawalcredentials, amount, fork_id, cred_type)",
 		" VALUES ",
 	)
 	argIdx := 0
-	fieldCount := 9
+	fieldCount := 10
 
 	args := make([]any, len(deposits)*fieldCount)
 	for i, deposit := range deposits {
@@ -46,20 +47,65 @@ func InsertDeposits(deposits []*dbtypes.Deposit, tx *sqlx.Tx) error {
 		args[argIdx+6] = deposit.WithdrawalCredentials[:]
 		args[argIdx+7] = deposit.Amount
 		args[argIdx+8] = deposit.ForkId
+		args[argIdx+9] = deposit.CredType
 		argIdx += fieldCount
 	}
 	fmt.Fprint(&sql, EngineQuery(map[dbtypes.DBEngineType]string{
 		dbtypes.DBEnginePgsql:  " ON CONFLICT (slot_index, slot_root) DO UPDATE SET deposit_index = excluded.deposit_index, orphaned = excluded.orphaned, fork_id = excluded.fork_id",
 		dbtypes.DBEngineSqlite: "",
 	}))
-	_, err := tx.Exec(sql.String(), args...)
+	_, err := tx.ExecContext(ctx, sql.String(), args...)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func GetDepositsFiltered(offset uint64, limit uint32, canonicalForkIds []uint64, filter *dbtypes.DepositFilter, txFilter *dbtypes.DepositTxFilter) ([]*dbtypes.DepositWithTx, uint64, error) {
+// GetDepositRequestsBySlots returns canonical deposit request rows whose
+// slot_number is in the given set, ordered by (slot_number, slot_index). It is
+// used to resolve the EL deposit index of queue entries that were reordered
+// (postponed) and can no longer be aligned by queue position, matching them by
+// their PendingDeposit.slot.
+func GetDepositRequestsBySlots(ctx context.Context, slots []uint64, canonicalForkIds []uint64) ([]*dbtypes.Deposit, error) {
+	deposits := []*dbtypes.Deposit{}
+	if len(slots) == 0 {
+		return deposits, nil
+	}
+
+	// SQLite caps bound variables (default 999); chunk to stay well below that.
+	const maxParams = 900
+
+	for start := 0; start < len(slots); start += maxParams {
+		end := min(start+maxParams, len(slots))
+		chunk := slots[start:end]
+
+		var sql strings.Builder
+		args := make([]any, 0, len(chunk)+len(canonicalForkIds))
+		fmt.Fprint(&sql, `SELECT deposit_index, slot_number, slot_index, slot_root, orphaned, publickey, withdrawalcredentials, amount, fork_id, cred_type
+			FROM deposits
+			WHERE slot_number IN (`)
+		for _, slot := range chunk {
+			args = append(args, slot)
+		}
+		appendDollarPlaceholders(&sql, 1, len(chunk), ", ")
+		fmt.Fprint(&sql, ")")
+
+		filterOp := "AND"
+		appendWithOrphanedFilter(&sql, &args, &filterOp, 0, canonicalForkIds, "deposits.fork_id")
+
+		fmt.Fprint(&sql, " ORDER BY slot_number, slot_index")
+
+		var chunkResult []*dbtypes.Deposit
+		if err := ReaderDb.SelectContext(ctx, &chunkResult, sql.String(), args...); err != nil {
+			return nil, fmt.Errorf("error fetching deposit requests by slots: %w", err)
+		}
+		deposits = append(deposits, chunkResult...)
+	}
+
+	return deposits, nil
+}
+
+func GetDepositsFiltered(ctx context.Context, offset uint64, limit uint32, canonicalForkIds []uint64, filter *dbtypes.DepositFilter, txFilter *dbtypes.DepositTxFilter) ([]*dbtypes.DepositWithTx, uint64, error) {
 	var sql strings.Builder
 	args := []any{}
 	fmt.Fprint(&sql, `
@@ -110,42 +156,44 @@ func GetDepositsFiltered(offset uint64, limit uint32, canonicalForkIds []uint64,
 		filterOp = "AND"
 	}
 
-	if filter.WithOrphaned != 1 {
-		forkIdStr := make([]string, len(canonicalForkIds))
-		for i, forkId := range canonicalForkIds {
-			forkIdStr[i] = fmt.Sprintf("%v", forkId)
-		}
-		if len(forkIdStr) == 0 {
-			forkIdStr = append(forkIdStr, "0")
-		}
-
-		if filter.WithOrphaned == 0 {
-			fmt.Fprintf(&sql, " %v deposits.fork_id IN (%v)", filterOp, strings.Join(forkIdStr, ","))
-			filterOp = "AND"
-		} else if filter.WithOrphaned == 2 {
-			fmt.Fprintf(&sql, " %v deposits.fork_id NOT IN (%v)", filterOp, strings.Join(forkIdStr, ","))
-			filterOp = "AND"
-		}
-	}
+	appendWithOrphanedFilter(&sql, &args, &filterOp, filter.WithOrphaned, canonicalForkIds, "deposits.fork_id")
 
 	if txFilter != nil {
-		if txFilter.WithValid == 0 {
+		switch txFilter.WithValid {
+		case 0:
 			fmt.Fprintf(&sql, " %v deposit_txs.valid_signature IN (1, 2)", filterOp)
 			filterOp = "AND"
-		} else if txFilter.WithValid == 2 {
+		case 2:
 			fmt.Fprintf(&sql, " %v deposit_txs.valid_signature = 0", filterOp)
 			filterOp = "AND"
 		}
 
 		if len(txFilter.WithdrawalAddress) > 0 {
+			// 0x01 = ETH1, 0x02 = compounding, 0x03 = builder deposit
 			wdcreds1 := make([]byte, 32)
 			wdcreds1[0] = 0x01
 			copy(wdcreds1[12:], txFilter.WithdrawalAddress)
 			wdcreds2 := make([]byte, 32)
 			wdcreds2[0] = 0x02
 			copy(wdcreds2[12:], txFilter.WithdrawalAddress)
-			args = append(args, wdcreds1, wdcreds2)
-			fmt.Fprintf(&sql, " %v (deposits.withdrawalcredentials = $%v OR deposits.withdrawalcredentials = $%v)", filterOp, len(args)-1, len(args))
+			wdcreds3 := make([]byte, 32)
+			wdcreds3[0] = 0x03
+			copy(wdcreds3[12:], txFilter.WithdrawalAddress)
+			args = append(args, wdcreds1, wdcreds2, wdcreds3)
+			fmt.Fprintf(&sql, " %v (deposits.withdrawalcredentials = $%v OR deposits.withdrawalcredentials = $%v OR deposits.withdrawalcredentials = $%v)", filterOp, len(args)-2, len(args)-1, len(args))
+			filterOp = "AND"
+		}
+
+		if len(txFilter.WithdrawalCredTypes) > 0 {
+			fmt.Fprintf(&sql, " %v deposits.cred_type IN (", filterOp)
+			for i, credType := range txFilter.WithdrawalCredTypes {
+				if i > 0 {
+					fmt.Fprintf(&sql, ", ")
+				}
+				args = append(args, uint16(credType))
+				fmt.Fprintf(&sql, "$%v", len(args))
+			}
+			fmt.Fprintf(&sql, ")")
 			filterOp = "AND"
 		}
 
@@ -202,7 +250,7 @@ func GetDepositsFiltered(offset uint64, limit uint32, canonicalForkIds []uint64,
 	fmt.Fprintf(&sql, ") AS t1")
 
 	deposits := []*dbtypes.DepositWithTx{}
-	err := ReaderDb.Select(&deposits, sql.String(), args...)
+	err := ReaderDb.SelectContext(ctx, &deposits, sql.String(), args...)
 	if err != nil {
 		logger.Errorf("Error while fetching filtered deposits: %v", err)
 		return nil, 0, err

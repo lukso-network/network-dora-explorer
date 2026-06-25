@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -58,7 +59,7 @@ func getForksPageData() (*models.ForksPageData, error) {
 	pageData := &models.ForksPageData{}
 	pageCacheKey := "forks"
 	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
-		pageData, cacheTimeout := buildForksPageData()
+		pageData, cacheTimeout := buildForksPageData(pageCall.CallCtx)
 		pageCall.CacheTimeout = cacheTimeout
 		return pageData
 	})
@@ -72,14 +73,14 @@ func getForksPageData() (*models.ForksPageData, error) {
 	return pageData, pageErr
 }
 
-func buildForksPageData() (*models.ForksPageData, time.Duration) {
+func buildForksPageData(ctx context.Context) (*models.ForksPageData, time.Duration) {
 	logrus.Debugf("forks page called")
 	pageData := &models.ForksPageData{}
 
 	headForks := services.GlobalBeaconService.GetConsensusClientForks()
 	chainState := services.GlobalBeaconService.GetChainState()
 	specs := chainState.GetSpecs()
-	cacheTime := time.Duration(specs.SecondsPerSlot) * time.Second
+	cacheTime := time.Duration(specs.SlotDurationMs) * time.Millisecond
 
 	// check each fork if it's really a fork and not just a syncing/stuck client
 	finalizedEpoch, _ := services.GlobalBeaconService.GetBeaconIndexer().GetBlockCacheState()
@@ -89,7 +90,7 @@ func buildForksPageData() (*models.ForksPageData, time.Duration) {
 		}
 		if fork.Slot < chainState.EpochToSlot(finalizedEpoch) {
 			// check block
-			dbBlock := db.GetSlotByRoot(fork.Root[:])
+			dbBlock := db.GetSlotByRoot(ctx, fork.Root[:])
 			if dbBlock != nil && dbBlock.Status == dbtypes.Canonical {
 				headForks[0].AllClients = append(headForks[0].AllClients, fork.AllClients...)
 				headForks[idx] = nil
@@ -112,7 +113,7 @@ func buildForksPageData() (*models.ForksPageData, time.Duration) {
 			consensusClient := client.GetClient()
 			clientHeadSlot, _ := consensusClient.GetLastHead()
 			forkClient := &models.ForksPageDataClient{
-				Index:       int(client.GetIndex()) + 1,
+				Index:       uint64(client.GetIndex()) + 1,
 				Name:        consensusClient.GetName(),
 				Version:     consensusClient.GetVersion(),
 				Status:      consensusClient.GetStatus().String(),

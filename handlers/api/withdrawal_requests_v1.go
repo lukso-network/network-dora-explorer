@@ -6,11 +6,11 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethpandaops/dora/clients/consensus"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -186,13 +186,13 @@ func APIWithdrawalRequestsV1(w http.ResponseWriter, r *http.Request) {
 
 	// Get withdrawal requests from service
 	dbElWithdrawals, totalPendingTxRows, totalRequests := services.GlobalBeaconService.GetWithdrawalRequestsByFilter(
-		withdrawalRequestFilter, offset, uint32(limit))
+		r.Context(), withdrawalRequestFilter, offset, uint32(limit))
 
 	chainState := services.GlobalBeaconService.GetChainState()
 	headBlock := services.GlobalBeaconService.GetBeaconIndexer().GetCanonicalHead(nil)
 	headBlockNum := uint64(0)
-	if headBlock != nil && headBlock.GetBlockIndex() != nil {
-		headBlockNum = uint64(headBlock.GetBlockIndex().ExecutionNumber)
+	if headBlock != nil && headBlock.GetBlockIndex(r.Context()) != nil {
+		headBlockNum = uint64(headBlock.GetBlockIndex(r.Context()).ExecutionNumber)
 	}
 
 	var withdrawalRequests []*APIWithdrawalRequestInfo

@@ -1,6 +1,10 @@
 package types
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // Config is a struct to hold the configuration data
 type Config struct {
@@ -46,12 +50,18 @@ type Config struct {
 		ValidatorNamesRefreshInterval time.Duration `yaml:"validatorNamesRefreshInterval" envconfig:"FRONTEND_VALIDATOR_REFRESH_INTERVAL"`
 		ValidatorNamesResolveInterval time.Duration `yaml:"validatorNamesResolveInterval" envconfig:"FRONTEND_VALIDATOR_RESOLVE_INTERVAL"`
 
-		PageCallTimeout  time.Duration `yaml:"pageCallTimeout" envconfig:"FRONTEND_PAGE_CALL_TIMEOUT"`
-		HttpReadTimeout  time.Duration `yaml:"httpReadTimeout" envconfig:"FRONTEND_HTTP_READ_TIMEOUT"`
-		HttpWriteTimeout time.Duration `yaml:"httpWriteTimeout" envconfig:"FRONTEND_HTTP_WRITE_TIMEOUT"`
-		HttpIdleTimeout  time.Duration `yaml:"httpIdleTimeout" envconfig:"FRONTEND_HTTP_IDLE_TIMEOUT"`
-		AllowDutyLoading bool          `yaml:"allowDutyLoading" envconfig:"FRONTEND_ALLOW_DUTY_LOADING"`
-		DisablePageCache bool          `yaml:"disablePageCache" envconfig:"FRONTEND_DISABLE_PAGE_CACHE"`
+		BuildoorOverviewUrl     string        `yaml:"buildoorOverviewUrl" envconfig:"FRONTEND_BUILDOOR_OVERVIEW_URL"`
+		BuildoorUrls            []string      `yaml:"buildoorUrls" envconfig:"FRONTEND_BUILDOOR_URLS"`
+		BuildoorRefreshInterval time.Duration `yaml:"buildoorRefreshInterval" envconfig:"FRONTEND_BUILDOOR_REFRESH_INTERVAL"`
+
+		PageCallTimeout       time.Duration `yaml:"pageCallTimeout" envconfig:"FRONTEND_PAGE_CALL_TIMEOUT"`
+		MaxConcurrentPages    *int          `yaml:"maxConcurrentPages" envconfig:"FRONTEND_MAX_CONCURRENT_PAGES"`
+		MaxConcurrentPageType *int          `yaml:"maxConcurrentPageType" envconfig:"FRONTEND_MAX_CONCURRENT_PAGE_TYPE"`
+		HttpReadTimeout       time.Duration `yaml:"httpReadTimeout" envconfig:"FRONTEND_HTTP_READ_TIMEOUT"`
+		HttpWriteTimeout      time.Duration `yaml:"httpWriteTimeout" envconfig:"FRONTEND_HTTP_WRITE_TIMEOUT"`
+		HttpIdleTimeout       time.Duration `yaml:"httpIdleTimeout" envconfig:"FRONTEND_HTTP_IDLE_TIMEOUT"`
+		AllowDutyLoading      bool          `yaml:"allowDutyLoading" envconfig:"FRONTEND_ALLOW_DUTY_LOADING"`
+		DisablePageCache      bool          `yaml:"disablePageCache" envconfig:"FRONTEND_DISABLE_PAGE_CACHE"`
 
 		ShowSensitivePeerInfos bool `yaml:"showSensitivePeerInfos" envconfig:"FRONTEND_SHOW_SENSITIVE_PEER_INFOS"`
 		ShowPeerDASInfos       bool `yaml:"showPeerDASInfos" envconfig:"FRONTEND_SHOW_PEER_DAS_INFOS"`
@@ -62,6 +72,10 @@ type Config struct {
 		// DAS Guardian configuration
 		DisableDasGuardianCheck   bool `yaml:"disableDasGuardianCheck" envconfig:"FRONTEND_DISABLE_DAS_GUARDIAN_CHECK"`
 		EnableDasGuardianMassScan bool `yaml:"enableDasGuardianMassScan" envconfig:"FRONTEND_ENABLE_DAS_GUARDIAN_MASS_SCAN"`
+
+		// Tracoor configuration
+		TracoorUrl     string `yaml:"tracoorUrl" envconfig:"FRONTEND_TRACOOR_URL"`
+		TracoorNetwork string `yaml:"tracoorNetwork" envconfig:"FRONTEND_TRACOOR_NETWORK"`
 	} `yaml:"frontend"`
 
 	Api struct {
@@ -88,6 +102,7 @@ type Config struct {
 		Endpoint     string           `yaml:"endpoint" envconfig:"BEACONAPI_ENDPOINT"`
 		Endpoints    []EndpointConfig `yaml:"endpoints"`
 		EndpointsURL string           `yaml:"endpointsUrl" envconfig:"BEACONAPI_ENDPOINTS_URL"`
+		ClientIndex  *int             `yaml:"clientIndex" envconfig:"BEACONAPI_CLIENT_INDEX"`
 
 		LocalCacheSize       int    `yaml:"localCacheSize" envconfig:"BEACONAPI_LOCAL_CACHE_SIZE"`
 		SkipFinalAssignments bool   `yaml:"skipFinalAssignments" envconfig:"BEACONAPI_SKIP_FINAL_ASSIGNMENTS"`
@@ -104,6 +119,7 @@ type Config struct {
 		LogBatchSize       int    `yaml:"logBatchSize" envconfig:"EXECUTIONAPI_LOG_BATCH_SIZE"`
 		DepositDeployBlock int    `yaml:"depositDeployBlock" envconfig:"EXECUTIONAPI_DEPOSIT_DEPLOY_BLOCK"` // el block number from where to crawl the deposit system contract (should be <=, but close to deposit contract deployment)
 		ElectraDeployBlock int    `yaml:"electraDeployBlock" envconfig:"EXECUTIONAPI_ELECTRA_DEPLOY_BLOCK"` // el block number from where to crawl the electra system contracts (should be <=, but close to electra fork activation block)
+		GloasDeployBlock   int    `yaml:"gloasDeployBlock" envconfig:"EXECUTIONAPI_GLOAS_DEPLOY_BLOCK"`     // el block number from where to crawl the gloas builder system contracts (should be <=, but close to gloas fork activation block)
 		GenesisConfig      string `yaml:"genesisConfig" envconfig:"EXECUTIONAPI_GENESIS_CONFIG"`            // path or URL to genesis.json file in geth format
 	} `yaml:"executionapi"`
 
@@ -117,9 +133,16 @@ type Config struct {
 		SyncEpochCooldown               uint   `yaml:"syncEpochCooldown" envconfig:"INDEXER_SYNC_EPOCH_COOLDOWN"`
 		MaxParallelValidatorSetRequests uint   `yaml:"maxParallelValidatorSetRequests" envconfig:"INDEXER_MAX_PARALLEL_VALIDATOR_SET_REQUESTS"`
 		DisableBlockDB                  bool   `yaml:"disableBlockDB" envconfig:"INDEXER_DISABLE_BLOCK_DB"`
+		DisableBlockDBDuties            bool   `yaml:"disableBlockDBDuties" envconfig:"INDEXER_DISABLE_BLOCK_DB_DUTIES"`
 		PubkeyCachePath                 string `yaml:"pubkeyCachePath" envconfig:"INDEXER_PUBKEY_CACHE_PATH"`
 
 		BadChainRoots []string `yaml:"badChainRoots" envconfig:"INDEXER_BAD_CHAIN_ROOTS"`
+
+		StateCache struct {
+			Enabled   *bool  `yaml:"enabled" envconfig:"INDEXER_STATE_CACHE_ENABLED"`
+			Path      string `yaml:"path" envconfig:"INDEXER_STATE_CACHE_PATH"`
+			MaxStates uint   `yaml:"maxStates" envconfig:"INDEXER_STATE_CACHE_MAX_STATES"`
+		} `yaml:"stateCache"`
 	} `yaml:"indexer"`
 
 	TxSignature struct {
@@ -128,6 +151,8 @@ type Config struct {
 		LookupBatchSize   uint64        `yaml:"lookupBatchSize" envconfig:"TXSIG_LOOKUP_INTERVAL"`
 		ConcurrencyLimit  uint64        `yaml:"concurrencyLimit" envconfig:"TXSIG_CONCURRENCY_LIMIT"`
 		Disable4Bytes     bool          `yaml:"disable4Bytes" envconfig:"TXSIG_DISABLE_4BYTES"`
+		DisableSourcify   bool          `yaml:"disableSourcify" envconfig:"TXSIG_DISABLE_SOURCIFY"`
+		CbtBaseUrl        string        `yaml:"cbtBaseUrl" envconfig:"TXSIG_CBT_BASE_URL"`
 		RecheckTimeout    time.Duration `yaml:"recheckTimeout" envconfig:"TXSIG_RECHECK_TIMEOUT"`
 	} `yaml:"txsig"`
 
@@ -136,18 +161,32 @@ type Config struct {
 		RefreshInterval time.Duration    `yaml:"refreshInterval" envconfig:"MEVINDEXER_REFRESH_INTERVAL"`
 	} `yaml:"mevIndexer"`
 
+	ExecutionIndexer struct {
+		Enabled         bool          `yaml:"enabled" envconfig:"EXECUTIONINDEXER_ENABLED"`
+		ParallelBlocks  int           `yaml:"parallelBlocks" envconfig:"EXECUTIONINDEXER_PARALLEL_BLOCKS"`
+		Retention       time.Duration `yaml:"retention" envconfig:"EXECUTIONINDEXER_RETENTION"`
+		CleanupInterval time.Duration `yaml:"cleanupInterval" envconfig:"EXECUTIONINDEXER_CLEANUP_INTERVAL"`
+
+		// Detail storage (Mode 3 features)
+		DetailsEnabled bool   `yaml:"detailsEnabled" envconfig:"EXECUTIONINDEXER_DETAILS_ENABLED"`
+		TracesEnabled  bool   `yaml:"tracesEnabled" envconfig:"EXECUTIONINDEXER_TRACES_ENABLED"`
+		DetailsMaxSize string `yaml:"detailsMaxSize" envconfig:"EXECUTIONINDEXER_DETAILS_MAX_SIZE"`
+	} `yaml:"executionIndexer"`
+
 	Database DatabaseConfig `yaml:"database"`
 
 	BlockDb struct {
-		Engine string              `yaml:"engine" envconfig:"BLOCKDB_ENGINE"`
+		Engine string              `yaml:"engine" envconfig:"BLOCKDB_ENGINE"` // "pebble", "s3", or "tiered"
 		Pebble PebbleBlockDBConfig `yaml:"pebble"`
 		S3     S3BlockDBConfig     `yaml:"s3"`
+		Tiered TieredBlockDBConfig `yaml:"tiered"` // For tiered storage (Pebble cache + S3 backend)
 	} `yaml:"blockDb"`
 
 	KillSwitch struct {
 		DisableSSZEncoding      bool `yaml:"disableSSZEncoding" envconfig:"KILLSWITCH_DISABLE_SSZ_ENCODING"`
 		DisableSSZRequests      bool `yaml:"disableSSZRequests" envconfig:"KILLSWITCH_DISABLE_SSZ_REQUESTS"`
 		DisableBlockCompression bool `yaml:"disableBlockCompression" envconfig:"KILLSWITCH_DISABLE_BLOCK_COMPRESSION"`
+		DisableSSZPageCache     bool `yaml:"disableSSZPageCache" envconfig:"KILLSWITCH_DISABLE_SSZ_PAGE_CACHE"`
 	} `yaml:"killSwitch"`
 
 	AuthGroups map[string]*AuthGroupConfig `yaml:"authGroups"`
@@ -233,19 +272,71 @@ type PgsqlWriterDatabaseConfig struct {
 	MaxIdleConns int    `yaml:"maxIdleConns" envconfig:"DATABASE_PGSQL_WRITER_MAX_IDLE_CONNS"`
 }
 
-type PebbleBlockDBConfig struct {
-	Path      string `yaml:"path" envconfig:"BLOCKDB_ROCKSDB_PATH"`
-	CacheSize int    `yaml:"cacheSize" envconfig:"BLOCKDB_ROCKSDB_CACHE_SIZE"`
+// BlockDbRetentionConfig configures per-object-type retention behavior.
+type BlockDbRetentionConfig struct {
+	Enabled       bool          `yaml:"enabled"`
+	RetentionTime time.Duration `yaml:"retentionTime"` // For age-based cleanup
+	MaxSize       int64         `yaml:"maxSize"`       // Size limit in MB (0 = unlimited)
+	CleanupMode   string        `yaml:"cleanupMode"`   // "age" or "lru"
 }
 
+// PebbleBlockDBConfig configures the Pebble (local) storage engine.
+type PebbleBlockDBConfig struct {
+	Path      string `yaml:"path" envconfig:"BLOCKDB_PEBBLE_PATH"`
+	CacheSize int    `yaml:"cacheSize" envconfig:"BLOCKDB_PEBBLE_CACHE_SIZE"` // Pebble internal cache in MB
+
+	// Per-object-type retention configuration (used in tiered mode)
+	HeaderRetention  BlockDbRetentionConfig `yaml:"headerRetention"`
+	BodyRetention    BlockDbRetentionConfig `yaml:"bodyRetention"`
+	PayloadRetention BlockDbRetentionConfig `yaml:"payloadRetention"`
+	BalRetention     BlockDbRetentionConfig `yaml:"balRetention"`
+
+	// Cleanup configuration
+	CleanupInterval time.Duration `yaml:"cleanupInterval" envconfig:"BLOCKDB_PEBBLE_CLEANUP_INTERVAL"`
+}
+
+// S3BlockDBConfig configures the S3 (remote) storage engine.
 type S3BlockDBConfig struct {
-	Endpoint             string `yaml:"endpoint" envconfig:"BLOCKDB_S3_ENDPOINT"`
-	Secure               bool   `yaml:"secure" envconfig:"BLOCKDB_S3_SECURE"`
-	Bucket               string `yaml:"bucket" envconfig:"BLOCKDB_S3_BUCKET"`
-	Region               string `yaml:"region" envconfig:"BLOCKDB_S3_REGION"`
-	AccessKey            string `yaml:"accessKey" envconfig:"BLOCKDB_S3_ACCESS_KEY"`
-	SecretKey            string `yaml:"secretKey" envconfig:"BLOCKDB_S3_SECRET_KEY"`
-	Path                 string `yaml:"path" envconfig:"BLOCKDB_S3_PATH"`
-	MaxConcurrentUploads uint   `yaml:"maxConcurrentUploads" envconfig:"BLOCKDB_S3_MAX_CONCURRENT_UPLOADS"`
-	UploadQueueSize      uint   `yaml:"uploadQueueSize" envconfig:"BLOCKDB_S3_UPLOAD_QUEUE_SIZE"`
+	Endpoint            string   `yaml:"endpoint" envconfig:"BLOCKDB_S3_ENDPOINT"`
+	Secure              YamlBool `yaml:"secure" envconfig:"BLOCKDB_S3_SECURE"`
+	Bucket              string   `yaml:"bucket" envconfig:"BLOCKDB_S3_BUCKET"`
+	Region              string   `yaml:"region" envconfig:"BLOCKDB_S3_REGION"`
+	AccessKey           string   `yaml:"accessKey" envconfig:"BLOCKDB_S3_ACCESS_KEY"`
+	SecretKey           string   `yaml:"secretKey" envconfig:"BLOCKDB_S3_SECRET_KEY"`
+	Path                string   `yaml:"path" envconfig:"BLOCKDB_S3_PATH"`
+	EnableRangeRequests bool     `yaml:"enableRangeRequests" envconfig:"BLOCKDB_S3_ENABLE_RANGE_REQUESTS"` // Use HTTP Range requests for selective loading
+}
+
+// TieredBlockDBConfig configures tiered storage (Pebble cache + S3 backend).
+type TieredBlockDBConfig struct {
+	Pebble PebbleBlockDBConfig `yaml:"pebble"`
+	S3     S3BlockDBConfig     `yaml:"s3"`
+}
+
+// YamlBool is a bool type that can be unmarshalled from both
+// YAML booleans (true/false) and strings ("true"/"false").
+type YamlBool bool
+
+func (b *YamlBool) UnmarshalYAML(unmarshal func(any) error) error {
+	var boolVal bool
+	if err := unmarshal(&boolVal); err == nil {
+		*b = YamlBool(boolVal)
+		return nil
+	}
+
+	var strVal string
+	if err := unmarshal(&strVal); err != nil {
+		return fmt.Errorf("cannot unmarshal into bool: %w", err)
+	}
+
+	switch strings.ToLower(strVal) {
+	case "true", "yes", "1":
+		*b = true
+	case "false", "no", "0":
+		*b = false
+	default:
+		return fmt.Errorf("cannot parse %q as bool", strVal)
+	}
+
+	return nil
 }

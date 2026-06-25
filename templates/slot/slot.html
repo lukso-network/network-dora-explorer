@@ -3,13 +3,13 @@
     <div class="d-md-flex py-2 justify-content-md-between">
       <h1 class="h4 my-2 mb-md-0 h1-pager">
         {{- if not (eq .Slot 0) -}}
-          <a href="/slot/{{ .PreviousSlot }}"><i class="fa fa-chevron-left"></i></a>
+          <a href="/slot/{{ .PreviousSlot }}" class="slot-nav-link" data-slot-nav-base="/slot/{{ .PreviousSlot }}"><i class="fa fa-chevron-left"></i></a>
         {{- else -}}
           <a></a>
         {{- end -}}
         <span><i class="fas fa-cube mx-2"></i>Slot <span id="slot">{{ .Slot }}</span></span>
         {{- if gt .NextSlot 0 -}}
-          <a href="/slot/{{ .NextSlot }}"><i class="fa fa-chevron-right"></i></a>
+          <a href="/slot/{{ .NextSlot }}" class="slot-nav-link" data-slot-nav-base="/slot/{{ .NextSlot }}"><i class="fa fa-chevron-right"></i></a>
         {{- else -}}
           <a></a>
         {{- end -}}
@@ -43,9 +43,19 @@
             <a class="nav-link" id="transactions-tab" data-bs-toggle="tab" href="#transactions" role="tab" aria-controls="transactions" aria-selected="false">Transactions <span class="badge bg-secondary text-white">{{ .Block.TransactionsCount }}</span></a>
           </li>
         {{ end }}
+        {{ if gt .Block.BidsCount 0 }}
+          <li class="nav-item">
+            <a class="nav-link" id="bids-tab" data-bs-toggle="tab" href="#bids" role="tab" aria-controls="bids" aria-selected="false">Bids <span class="badge bg-secondary text-white">{{ .Block.BidsCount }}</span></a>
+          </li>
+        {{ end }}
         <li class="nav-item">
           <a class="nav-link" id="attestations-tab" data-bs-toggle="tab" href="#attestations" role="tab" aria-controls="attestations" aria-selected="false">Attestations <span class="badge bg-secondary text-white">{{ .Block.AttestationsCount }}</span></a>
         </li>
+        {{ if gt .Block.PtcVotesCount 0 }}
+          <li class="nav-item">
+            <a class="nav-link" id="ptcVotes-tab" data-bs-toggle="tab" href="#ptcVotes" role="tab" aria-controls="ptcVotes" aria-selected="false">PTC Votes <span class="badge bg-secondary text-white">{{ .Block.PtcVotesCount }}</span></a>
+          </li>
+        {{ end }}
         {{ if gt .Block.DepositsCount 0 }}
           <li class="nav-item">
             <a class="nav-link" id="deposits-tab" data-bs-toggle="tab" href="#deposits" role="tab" aria-controls="deposits" aria-selected="false">Deposits <span class="badge bg-secondary text-white">{{ .Block.DepositsCount }}</span></a>
@@ -81,24 +91,30 @@
             <a class="nav-link" id="blobSidecars-tab" data-bs-toggle="tab" href="#blobSidecars" role="tab" aria-controls="blobSidecars" aria-selected="false">Blob Sidecars <span class="badge bg-secondary text-white">{{ .Block.BlobsCount }}</span></a>
           </li>
         {{ end }}
-        {{ if gt .Block.DepositRequestsCount 0 }}
+        {{ $executionRequestsCount := addUI64 (addUI64 (addUI64 (addUI64 .Block.DepositRequestsCount .Block.WithdrawalRequestsCount) .Block.ConsolidationRequestsCount) .Block.BuilderDepositRequestsCount) .Block.BuilderExitRequestsCount }}
+        {{ if gt $executionRequestsCount 0 }}
           <li class="nav-item">
-            <a class="nav-link" id="depositRequests-tab" data-bs-toggle="tab" href="#depositRequests" role="tab" aria-controls="depositRequests" aria-selected="false">Deposit Requests <span class="badge bg-secondary text-white">{{ .Block.DepositRequestsCount }}</span></a>
+            <a class="nav-link" id="executionRequests-tab" data-bs-toggle="tab" href="#executionRequests" role="tab" aria-controls="executionRequests" aria-selected="false">Execution Requests <span class="badge bg-secondary text-white">{{ $executionRequestsCount }}</span></a>
           </li>
         {{ end }}
-        {{ if gt .Block.WithdrawalRequestsCount 0 }}
+        {{ if and .Block.ExecutionData .Block.ExecutionData.BlockAccessList }}
           <li class="nav-item">
-            <a class="nav-link" id="withdrawalRequests-tab" data-bs-toggle="tab" href="#withdrawalRequests" role="tab" aria-controls="withdrawalRequests" aria-selected="false">Withdrawal Requests <span class="badge bg-secondary text-white">{{ .Block.WithdrawalRequestsCount }}</span></a>
+            <a class="nav-link" id="accessList-tab" data-bs-toggle="tab" href="#accessList" role="tab" aria-controls="accessList" aria-selected="false">Access List <span class="badge bg-secondary text-white">{{ len .Block.ExecutionData.BlockAccessList }}</span></a>
           </li>
         {{ end }}
-        {{ if gt .Block.ConsolidationRequestsCount 0 }}
+        {{ if gt .Block.InclusionListsCount 0 }}
           <li class="nav-item">
-            <a class="nav-link" id="consolidationRequests-tab" data-bs-toggle="tab" href="#consolidationRequests" role="tab" aria-controls="consolidationRequests" aria-selected="false">Consolidation Requests <span class="badge bg-secondary text-white">{{ .Block.ConsolidationRequestsCount }}</span></a>
+            <a class="nav-link" id="inclusionLists-tab" data-bs-toggle="tab" href="#inclusionLists" role="tab" aria-controls="inclusionLists" aria-selected="false">Inclusion Lists <span class="badge bg-secondary text-white">{{ .Block.InclusionListsCount }}</span></a>
+          </li>
+        {{ end }}
+        {{ if gt .Block.ExecutionProofsCount 0 }}
+          <li class="nav-item">
+            <a class="nav-link" id="proofs-tab" data-bs-toggle="tab" href="#proofs" role="tab" aria-controls="proofs" aria-selected="false">Proofs <span class="badge bg-secondary text-white">{{ .Block.ExecutionProofsCount }}</span></a>
           </li>
         {{ end }}
         {{ if .Block }}
           <li class="nav-item ms-auto">
-            <a class="nav-link" id="download-tab" data-bs-toggle="tab" href="#download" role="tab" aria-controls="download" aria-selected="false">
+            <a class="nav-link" id="download-tab" data-bs-toggle="tab" href="#download" role="tab" aria-controls="download" aria-selected="false" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Download">
               <i class="fas fa-download"></i>
             </a>
           </li>
@@ -222,86 +238,198 @@
             {{ template "block_blobSidecar" . }}
           </div>
         {{ end }}
-        {{ if gt .Block.DepositRequestsCount 0 }}
-          <div class="tab-pane fade show active" id="depositRequests" role="tabpanel" aria-labelledby="depositRequests-tab">
+        {{ $executionRequestsCount := addUI64 (addUI64 (addUI64 (addUI64 .Block.DepositRequestsCount .Block.WithdrawalRequestsCount) .Block.ConsolidationRequestsCount) .Block.BuilderDepositRequestsCount) .Block.BuilderExitRequestsCount }}
+        {{ if gt $executionRequestsCount 0 }}
+          <div class="tab-pane fade show active" id="executionRequests" role="tabpanel" aria-labelledby="executionRequests-tab">
             <div class="card block-card">
-              <div style="margin-bottom: -.25rem;" class="card-body px-0 py-1">
+              <div class="card-body px-0 py-1">
                 <div class="row p-1 mx-0">
-                  <h3 class="h5 col-md-12 text-center"><b>Showing {{ .Block.DepositRequestsCount }} Deposit Requests</b></h3>
+                  <h3 class="h5 col-md-12 text-center mb-0"><b>Showing {{ $executionRequestsCount }} Execution Requests{{ if .Block.RequestsFromParentPayload }} from the Parent Payload{{ end }}</b></h3>
+                  {{ if .Block.RequestsFromParentPayload }}<p class="col-md-12 text-center text-muted mb-0"><small>These requests were included in the parent block's payload (EIP-7732) and are processed in this block.</small></p>{{ end }}
                 </div>
               </div>
+              {{ if gt .Block.DepositRequestsCount 0 }}
+                <div class="exec-request-section border-top">
+                  <h4 class="h6 px-3 pt-2 mb-1">Deposit Requests <span class="badge bg-secondary text-white">{{ .Block.DepositRequestsCount }}</span></h4>
+                  {{ template "block_deposit_requests" . }}
+                </div>
+              {{ end }}
+              {{ if gt .Block.WithdrawalRequestsCount 0 }}
+                <div class="exec-request-section border-top">
+                  <h4 class="h6 px-3 pt-2 mb-1">Withdrawal Requests <span class="badge bg-secondary text-white">{{ .Block.WithdrawalRequestsCount }}</span></h4>
+                  {{ template "block_withdrawal_requests" . }}
+                </div>
+              {{ end }}
+              {{ if gt .Block.ConsolidationRequestsCount 0 }}
+                <div class="exec-request-section border-top">
+                  <h4 class="h6 px-3 pt-2 mb-1">Consolidation Requests <span class="badge bg-secondary text-white">{{ .Block.ConsolidationRequestsCount }}</span></h4>
+                  {{ template "block_consolidation_requests" . }}
+                </div>
+              {{ end }}
+              {{ if gt .Block.BuilderDepositRequestsCount 0 }}
+                <div class="exec-request-section border-top">
+                  <h4 class="h6 px-3 pt-2 mb-1">Builder Deposits <span class="badge bg-secondary text-white">{{ .Block.BuilderDepositRequestsCount }}</span></h4>
+                  {{ template "block_builder_deposit_requests" . }}
+                </div>
+              {{ end }}
+              {{ if gt .Block.BuilderExitRequestsCount 0 }}
+                <div class="exec-request-section border-top">
+                  <h4 class="h6 px-3 pt-2 mb-1">Builder Exits <span class="badge bg-secondary text-white">{{ .Block.BuilderExitRequestsCount }}</span></h4>
+                  {{ template "block_builder_exit_requests" . }}
+                </div>
+              {{ end }}
             </div>
-            {{ template "block_deposit_requests" . }}
           </div>
         {{ end }}
-        {{ if gt .Block.WithdrawalRequestsCount 0 }}
-          <div class="tab-pane fade show active" id="withdrawalRequests" role="tabpanel" aria-labelledby="withdrawalRequests-tab">
+        {{ if and .Block.ExecutionData .Block.ExecutionData.BlockAccessList }}
+          <div class="tab-pane fade" id="accessList" role="tabpanel" aria-labelledby="accessList-tab">
             <div class="card block-card">
               <div style="margin-bottom: -.25rem;" class="card-body px-0 py-1">
                 <div class="row p-1 mx-0">
-                  <h3 class="h5 col-md-12 text-center"><b>Showing {{ .Block.WithdrawalRequestsCount }} Withdrawal Requests</b></h3>
+                  <h3 class="h5 col-md-12 text-center"><b>Block Access List (EIP-7928)</b></h3>
                 </div>
               </div>
+              {{ template "block_access_list" . }}
             </div>
-            {{ template "block_withdrawal_requests" . }}
           </div>
         {{ end }}
-        {{ if gt .Block.ConsolidationRequestsCount 0 }}
-          <div class="tab-pane fade show active" id="consolidationRequests" role="tabpanel" aria-labelledby="consolidationRequests-tab">
+        {{ if gt .Block.BidsCount 0 }}
+          <div class="tab-pane fade show active" id="bids" role="tabpanel" aria-labelledby="bids-tab">
             <div class="card block-card">
               <div style="margin-bottom: -.25rem;" class="card-body px-0 py-1">
                 <div class="row p-1 mx-0">
-                  <h3 class="h5 col-md-12 text-center"><b>Showing {{ .Block.ConsolidationRequestsCount }} Consolidation Requests </b></h3>
+                  <h3 class="h5 col-md-12 text-center"><b>Showing {{ .Block.BidsCount }} Execution Payload Bids</b></h3>
+                </div>
+              </div>
+              {{ template "block_bids" . }}
+            </div>
+          </div>
+        {{ end }}
+        {{ if gt .Block.PtcVotesCount 0 }}
+          <div class="tab-pane fade show active" id="ptcVotes" role="tabpanel" aria-labelledby="ptcVotes-tab">
+            <div class="card block-card">
+              <div style="margin-bottom: -.25rem;" class="card-body px-0 py-1">
+                <div class="row p-1 mx-0">
+                  <h3 class="h5 col-md-12 text-center"><b>Showing {{ .Block.PtcVotesCount }} PTC Votes (for slot {{ .Block.PtcVotes.VotedSlot }})</b></h3>
+                </div>
+              </div>
+              {{ template "block_ptc_votes" . }}
+            </div>
+          </div>
+        {{ end }}
+        {{ if gt .Block.InclusionListsCount 0 }}
+          <div class="tab-pane fade show active" id="inclusionLists" role="tabpanel" aria-labelledby="inclusionLists-tab">
+            <div class="card block-card">
+              <div style="margin-bottom: -.25rem;" class="card-body px-0 py-1">
+                <div class="row p-1 mx-0">
+                  <h3 class="h5 col-md-12 text-center"><b>Showing {{ .Block.InclusionListsCount }} Inclusion Lists</b></h3>
+                </div>
+              </div>
+              {{ template "block_inclusion_lists" . }}
+            </div>
+          </div>
+        {{ end }}
+        {{ if gt .Block.ExecutionProofsCount 0 }}
+          <div class="tab-pane fade show active" id="proofs" role="tabpanel" aria-labelledby="proofs-tab">
+            <div class="card block-card">
+              <div style="margin-bottom: -.25rem;" class="card-body px-0 py-1">
+                <div class="row p-1 mx-0">
+                  <h3 class="h5 col-md-12 text-center"><b>Proofs</b></h3>
                 </div>
               </div>
             </div>
-            {{ template "block_consolidation_requests" . }}
+            {{ template "block_proofs" . }}
           </div>
         {{ end }}
         {{ if .Block }}
           <div class="tab-pane fade" id="download" role="tabpanel" aria-labelledby="download-tab">
             <div class="card block-card">
               <div class="card-body">
-                <h3 class="h5 mb-4">Download Block Data</h3>
-                
-                <div class="row g-4">
-                  <div class="col-md-6">
-                    <div class="card h-100">
-                      <div class="card-header">
-                        <h4 class="h6 mb-0">Signed Beacon Block Header</h4>
-                      </div>
-                      <div class="card-body">
-                        <div class="d-grid gap-2">
-                          <a href="?download=header-ssz" class="btn btn-outline-primary">
-                            <i class="fas fa-file-download me-2"></i>Download as SSZ
-                          </a>
-                          <a href="?download=header-json" class="btn btn-outline-primary">
-                            <i class="fas fa-file-download me-2"></i>Download as JSON
-                          </a>
-                        </div>
-                      </div>
+                <h5 class="mb-3"><i class="fas fa-cube me-2"></i>Consensus Layer</h5>
+                <div class="list-group mb-4">
+                  <div class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div class="me-auto">
+                      <div class="fw-semibold">Signed Beacon Block Header</div>
+                      <small class="text-muted">Slot, proposer, roots, signature</small>
+                    </div>
+                    <div class="btn-group btn-group-sm" role="group" aria-label="Header downloads">
+                      <a href="?download=header-ssz" class="btn btn-outline-primary"><i class="fas fa-file-archive me-1"></i>SSZ</a>
+                      <a href="?download=header-json" class="btn btn-outline-primary"><i class="fas fa-file-code me-1"></i>JSON</a>
                     </div>
                   </div>
-
-                  <div class="col-md-6">
-                    <div class="card h-100">
-                      <div class="card-header">
-                        <h4 class="h6 mb-0">Signed Beacon Block</h4>
-                      </div>
-                      <div class="card-body">
-                        <div class="d-grid gap-2">
-                          <a href="?download=block-ssz" class="btn btn-outline-primary">
-                            <i class="fas fa-file-download me-2"></i>Download as SSZ
-                          </a>
-                          <a href="?download=block-json" class="btn btn-outline-primary">
-                            <i class="fas fa-file-download me-2"></i>Download as JSON
-                          </a>
-                        </div>
-                      </div>
+                  <div class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <div class="me-auto">
+                      <div class="fw-semibold">Signed Beacon Block</div>
+                      <small class="text-muted">Full block with body, attestations, and operations</small>
+                    </div>
+                    <div class="btn-group btn-group-sm" role="group" aria-label="Block downloads">
+                      <a href="?download=block-ssz" class="btn btn-outline-primary"><i class="fas fa-file-archive me-1"></i>SSZ</a>
+                      <a href="?download=block-json" class="btn btn-outline-primary"><i class="fas fa-file-code me-1"></i>JSON</a>
                     </div>
                   </div>
-
+                  {{ if and .Block.PayloadHeader (ne .Block.PayloadHeader.PayloadStatus 0) }}
+                    <div class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
+                      <div class="me-auto">
+                        <div class="fw-semibold">Signed Execution Payload Envelope</div>
+                        <small class="text-muted">Gloas builder envelope (EIP-7732)</small>
+                      </div>
+                      <div class="btn-group btn-group-sm" role="group" aria-label="Payload envelope downloads">
+                        <a href="?download=payload-ssz" class="btn btn-outline-primary"><i class="fas fa-file-archive me-1"></i>SSZ</a>
+                        <a href="?download=payload-json" class="btn btn-outline-primary"><i class="fas fa-file-code me-1"></i>JSON</a>
+                      </div>
+                    </div>
+                  {{ end }}
                 </div>
+
+                {{ if .Block.ExecutionData }}
+                  <h5 class="mb-3"><i class="fas fa-microchip me-2"></i>Execution Layer</h5>
+                  <div class="list-group mb-4">
+                    <div class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
+                      <div class="me-auto">
+                        <div class="fw-semibold">Execution Block</div>
+                        <small class="text-muted">eth_getBlockByHash format with full transactions</small>
+                      </div>
+                      <div class="btn-group btn-group-sm" role="group" aria-label="Execution block downloads">
+                        <a href="?download=block-body-json" class="btn btn-outline-primary"><i class="fas fa-file-code me-1"></i>JSON</a>
+                      </div>
+                    </div>
+                    {{ if .Block.ExecutionData.HasExecData }}
+                      <div class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
+                        <div class="me-auto">
+                          <div class="fw-semibold">Block Receipts</div>
+                          <small class="text-muted">All transaction receipts with logs</small>
+                        </div>
+                        <div class="btn-group btn-group-sm" role="group" aria-label="Receipts downloads">
+                          <a href="?download=receipts-json" class="btn btn-outline-primary"><i class="fas fa-file-code me-1"></i>JSON</a>
+                        </div>
+                      </div>
+                    {{ end }}
+                    {{ if .Block.ExecutionData.BlockAccessList }}
+                      <div class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
+                        <div class="me-auto">
+                          <div class="fw-semibold">Block Access List <small class="text-muted">(EIP-7928)</small></div>
+                          <small class="text-muted">Per-account storage / balance / nonce / code accesses</small>
+                        </div>
+                        <div class="btn-group btn-group-sm" role="group" aria-label="BAL downloads">
+                          <a href="?download=bal-rlp" class="btn btn-outline-primary"><i class="fas fa-file-archive me-1"></i>RLP</a>
+                          <a href="?download=bal-json" class="btn btn-outline-primary"><i class="fas fa-file-code me-1"></i>JSON</a>
+                        </div>
+                      </div>
+                    {{ end }}
+                  </div>
+                {{ end }}
+
+                {{ if .TracoorUrl }}
+                  <h5 class="mb-3"><i class="fas fa-project-diagram me-2"></i>Tracoor Traces</h5>
+                  <div id="tracoor-content">
+                    <div class="text-center py-4">
+                      <div class="spinner-border spinner-border-sm text-primary" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                      </div>
+                      <span class="ms-2 text-muted">Loading Tracoor traces…</span>
+                    </div>
+                  </div>
+                {{ end }}
               </div>
             </div>
           </div>
@@ -309,21 +437,170 @@
       {{ end }}
     </div>
     <script type="text/javascript">
-      Array.prototype.forEach.call(document.getElementById("tabContent").querySelectorAll(".tab-pane"), function(paneEl, paneIdx) {
+      Array.prototype.forEach.call(document.getElementById("tabContent").children, function(paneEl, paneIdx) {
+        if(!paneEl.classList.contains("tab-pane")) {
+          return;
+        }
         if(paneIdx > 0) {
           paneEl.classList.remove("active");
           paneEl.classList.remove("show");
         }
       });
       $(function() {
-        if(location.hash)
-          $('.nav-tabs a[href="' + location.hash + '"]').tab('show');
-        
+        function activateTabByHash() {
+          if (!location.hash) return;
+          var target = $('.nav-tabs a[href="' + location.hash + '"]');
+          if (target.length) target.tab('show');
+        }
+
+        function syncSlotNavHashes() {
+          var hash = window.location.hash || '';
+          $('.slot-nav-link').each(function() {
+            var base = this.getAttribute('data-slot-nav-base') || this.getAttribute('href');
+            this.setAttribute('href', base + hash);
+          });
+        }
+
+        activateTabByHash();
+        syncSlotNavHashes();
+        window.addEventListener('hashchange', function() {
+          activateTabByHash();
+          syncSlotNavHashes();
+        });
+
+        $('.nav-tabs a[data-bs-toggle="tab"]').on('shown.bs.tab', function(e) {
+          var href = e.target.getAttribute('href') || '';
+          if (!href.startsWith('#')) return;
+          var newHash = href === '#overview' ? '' : href;
+          if (window.location.hash !== newHash) {
+            window.history.replaceState(null, document.title, window.location.pathname + window.location.search + newHash);
+            syncSlotNavHashes();
+          }
+        });
+
         // Handle EIP-7918 info button click
         $('.eip7918-info-btn').on('click', function(e) {
           e.preventDefault();
           $('#eip7918-details').toggleClass('d-none');
         });
+
+        {{ if and .Block .TracoorUrl }}
+        // Tracoor lazy loading
+        var tracoorLoaded = false;
+        var tracoorUrl = "{{ .TracoorUrl }}";
+        var blockRoot = "0x{{ printf "%x" .Block.BlockRoot }}";
+        var stateRoot = "0x{{ printf "%x" .Block.StateRoot }}";
+        var executionBlockHash = {{ if .Block.ExecutionData }}"0x{{ printf "%x" .Block.ExecutionData.BlockHash }}"{{ else }}""{{ end }};
+
+        $('#download-tab').on('shown.bs.tab', function() {
+          if (tracoorLoaded) return;
+          tracoorLoaded = true;
+          loadTracoorData();
+        });
+
+        // Also load if URL hash is #download on page load
+        if (location.hash === '#download') {
+          loadTracoorData();
+          tracoorLoaded = true;
+        }
+
+        function loadTracoorData() {
+          var params = new URLSearchParams();
+          if (stateRoot) params.append('stateRoot', stateRoot);
+          if (executionBlockHash) params.append('executionBlockHash', executionBlockHash);
+
+          $.ajax({
+            url: '/slot/' + blockRoot + '/tracoor?' + params.toString(),
+            method: 'GET',
+            dataType: 'json',
+            success: function(data) {
+              renderTracoorData(data);
+            },
+            error: function(xhr, status, error) {
+              $('#tracoor-content').html('<div class="alert alert-danger">Failed to load Tracoor data: ' + error + '</div>');
+            }
+          });
+        }
+
+        function renderTracoorData(data) {
+          var html = '';
+          html += renderTracoorSection('fa-cube', 'Beacon Block Traces', data.beacon_blocks, data.beacon_blocks_error, 'beacon_block', data.tracoor_url);
+          html += renderTracoorSection('fa-database', 'Beacon State Traces', data.beacon_states, data.beacon_states_error, 'beacon_state', data.tracoor_url);
+          html += renderTracoorSection('fa-microchip', 'Execution Block Traces', data.execution_block_traces, data.execution_block_trace_error, 'execution_block_trace', data.tracoor_url);
+          $('#tracoor-content').html(html);
+        }
+
+        function renderTracoorSection(icon, title, items, err, type, tracoorBaseUrl) {
+          var count = (items && items.length) ? items.length : 0;
+          var html = '<h6 class="mb-2 mt-3 text-muted"><i class="fas ' + icon + ' me-2"></i>' + escapeHtml(title);
+          if (count > 0) {
+            html += ' <span class="badge bg-secondary">' + count + '</span>';
+          }
+          html += '</h6>';
+          if (err) {
+            html += '<div class="alert alert-warning mb-3 py-2 small"><i class="fas fa-exclamation-triangle me-2"></i>' + escapeHtml(err) + '</div>';
+          } else if (count > 0) {
+            html += renderTracoorTable(items, type, tracoorBaseUrl);
+          } else {
+            html += '<p class="text-muted small mb-3"><i class="fas fa-info-circle me-2"></i>None available.</p>';
+          }
+          return html;
+        }
+
+        function getClientBadgeClass(client) {
+          var clientLower = (client || '').toLowerCase();
+          var badgeClasses = {
+            'lighthouse': 'bg-primary',
+            'prysm': 'bg-success',
+            'teku': 'bg-info',
+            'nimbus': 'bg-warning text-dark',
+            'lodestar': 'bg-danger',
+            'grandine': 'bg-secondary',
+            'geth': 'bg-primary',
+            'nethermind': 'bg-success',
+            'besu': 'bg-info',
+            'erigon': 'bg-warning text-dark',
+            'reth': 'bg-danger'
+          };
+          return badgeClasses[clientLower] || 'bg-secondary';
+        }
+
+        function renderTracoorTable(items, type, tracoorBaseUrl) {
+          var isExecution = type === 'execution_block_trace';
+          var implField = isExecution ? 'execution_implementation' : 'beacon_implementation';
+
+          var html = '<div class="list-group mb-3">';
+
+          for (var i = 0; i < items.length; i++) {
+            var item = items[i];
+            var impl = item[implField] || '-';
+            var fetchedAt = new Date(item.fetched_at).toLocaleString();
+            var downloadUrl = tracoorBaseUrl + '/download/' + type + '/' + item.id;
+            var badgeClass = getClientBadgeClass(impl);
+
+            html += '<div class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">';
+            html +=   '<div class="me-auto text-truncate" style="min-width: 0;">';
+            html +=     '<div class="d-flex align-items-center flex-wrap gap-2">';
+            html +=       '<span class="badge ' + badgeClass + '">' + escapeHtml(impl) + '</span>';
+            html +=       '<span class="fw-semibold font-monospace small text-truncate" title="' + escapeHtml(item.node) + '">' + escapeHtml(item.node) + '</span>';
+            html +=     '</div>';
+            html +=     '<small class="text-muted d-block text-truncate" title="' + escapeHtml(item.node_version) + '">' + escapeHtml(item.node_version) + ' · ' + escapeHtml(fetchedAt) + '</small>';
+            html +=   '</div>';
+            html +=   '<a href="' + escapeHtml(downloadUrl) + '" class="btn btn-sm btn-outline-primary" target="_blank" title="Download trace"><i class="fas fa-download me-1"></i>Download</a>';
+            html += '</div>';
+          }
+
+          html += '</div>';
+          return html;
+        }
+
+        function escapeHtml(text) {
+          if (!text) return '';
+          var div = document.createElement('div');
+          div.textContent = text;
+          return div.innerHTML;
+        }
+        {{ end }}
       });
     </script>
     <div id="footer-placeholder" style="height:71px;"></div>
@@ -339,6 +616,16 @@
   }
   .eip7918-info-btn:hover {
     opacity: 0.8;
+  }
+  .exec-request-section {
+    padding-bottom: 0.25rem;
+  }
+  .exec-request-section > h4 {
+    color: var(--bs-secondary-color, #6c757d);
+    font-weight: 600;
+  }
+  .exec-request-section .table {
+    margin-bottom: 0;
   }
 </style>
 {{ end }}

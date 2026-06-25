@@ -73,7 +73,7 @@ func main() {
 	}
 
 	if cfg.Frontend.Enabled {
-		err = services.StartFrontendCache()
+		err = services.StartFrontendCache(logger.WithField("module", "frontendcache"))
 		if err != nil {
 			logger.Fatalf("error starting frontend cache service: %v", err)
 		}
@@ -188,6 +188,7 @@ func startFrontend(router *mux.Router) {
 	router.HandleFunc("/clients/execution", handlers.ClientsEl).Methods("GET")
 	router.HandleFunc("/clients/execution/refresh", handlers.ClientsELRefresh).Methods("POST")
 	router.HandleFunc("/clients/execution/refresh/status", handlers.ClientsELRefreshStatus).Methods("GET")
+	router.HandleFunc("/clients/execution/status/{clientName}", handlers.ClientsElStatus).Methods("GET")
 	router.HandleFunc("/forks", handlers.Forks).Methods("GET")
 	router.HandleFunc("/chain-forks", handlers.ChainForks).Methods("GET")
 	router.HandleFunc("/epochs", handlers.Epochs).Methods("GET")
@@ -195,8 +196,16 @@ func startFrontend(router *mux.Router) {
 	router.HandleFunc("/slots", handlers.Slots).Methods("GET")
 	router.HandleFunc("/slots/filtered", handlers.SlotsFiltered).Methods("GET")
 	router.HandleFunc("/slot/{slotOrHash}", handlers.Slot).Methods("GET")
-	router.HandleFunc("/slot/{root}/blob/{commitment}", handlers.SlotBlob).Methods("GET")
+	router.HandleFunc("/slot/{slotOrHash}/tracoor", handlers.SlotTracoor).Methods("GET")
+	router.HandleFunc("/slot/{slotOrHash}/duties", handlers.SlotDuties).Methods("GET")
+	router.HandleFunc("/slot/{root}/blob/{index}", handlers.SlotBlob).Methods("GET")
 	router.HandleFunc("/blocks", handlers.Blocks).Methods("GET")
+	router.HandleFunc("/blocks/filtered", handlers.BlocksFiltered).Methods("GET")
+	router.HandleFunc("/block/{numberOrHash}", handlers.Block).Methods("GET")
+	router.HandleFunc("/blobs", handlers.Blobs).Methods("GET")
+	router.HandleFunc("/address/{address}", handlers.Address).Methods("GET")
+	router.HandleFunc("/address/{address}/balances", handlers.AddressBalances).Methods("GET")
+	router.HandleFunc("/tx/{hash}", handlers.Transaction).Methods("GET")
 	router.HandleFunc("/mev/blocks", handlers.MevBlocks).Methods("GET")
 
 	router.HandleFunc("/search", handlers.Search).Methods("GET")
@@ -218,6 +227,7 @@ func startFrontend(router *mux.Router) {
 	router.HandleFunc("/validators/slashings", handlers.Slashings).Methods("GET")
 	router.HandleFunc("/validators/el_withdrawals", handlers.ElWithdrawals).Methods("GET")
 	router.HandleFunc("/validators/withdrawals", handlers.Withdrawals).Methods("GET")
+	router.HandleFunc("/validators/withdrawals/filtered", handlers.WithdrawalsList).Methods("GET")
 	router.HandleFunc("/validators/queued_withdrawals", handlers.QueuedWithdrawals).Methods("GET")
 	router.HandleFunc("/validators/consolidations", handlers.Consolidations).Methods("GET")
 	router.HandleFunc("/validators/queued_consolidations", handlers.QueuedConsolidations).Methods("GET")
@@ -226,11 +236,17 @@ func startFrontend(router *mux.Router) {
 	router.HandleFunc("/validators/submit_withdrawals", handlers.SubmitWithdrawal).Methods("GET")
 	router.HandleFunc("/validator/{idxOrPubKey}", handlers.Validator).Methods("GET")
 	router.HandleFunc("/validator/{index}/slots", handlers.ValidatorSlots).Methods("GET")
+	router.HandleFunc("/builders", handlers.Builders).Methods("GET")
+	router.HandleFunc("/builders/deposits", handlers.BuilderDeposits).Methods("GET")
+	router.HandleFunc("/builders/exits", handlers.BuilderExits).Methods("GET")
+	router.HandleFunc("/builders/submit_deposit", handlers.SubmitBuilderDeposit).Methods("GET")
+	router.HandleFunc("/builders/submit_exit", handlers.SubmitBuilderExit).Methods("GET")
+	router.HandleFunc("/builder/{idxOrPubKey}", handlers.BuilderDetail).Methods("GET")
 
 	if utils.Config.Frontend.Pprof {
 		// add pprof handler
 		router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux)
-		router.HandleFunc("/debug/cache", handlers.DebugCache).Methods("GET")
+		router.HandleFunc("/debug/cache", handlers.DebugPage).Methods("GET")
 	}
 
 	if utils.Config.Frontend.Debug {
@@ -306,6 +322,11 @@ func startApi(router *mux.Router) {
 		{"/v1/epochs", api.APIEpochsV1, []string{"GET", "OPTIONS"}, 1},
 		{"/v1/epoch/{epoch}", api.ApiEpochV1, []string{"GET", "OPTIONS"}, 1},
 		{"/v1/slot/{slotOrHash}", api.APISlotV1, []string{"GET", "OPTIONS"}, 1},
+		{"/v1/slot/{slotOrHash}/bids", api.APISlotBidsV1, []string{"GET", "OPTIONS"}, 1},
+		{"/v1/slot/{slotOrHash}/block_access_list", api.APISlotBlockAccessListV1, []string{"GET", "OPTIONS"}, 2},
+		{"/v1/slot/{slotOrHash}/ptc_votes", api.APISlotPtcVotesV1, []string{"GET", "OPTIONS"}, 1},
+		{"/v1/slot/{slotOrHash}/inclusion_lists", api.APISlotInclusionListsV1, []string{"GET", "OPTIONS"}, 1},
+		{"/v1/slot/{slotOrHash}/payload_header", api.APISlotPayloadHeaderV1, []string{"GET", "OPTIONS"}, 1},
 		{"/v1/slots", api.APISlotsV1, []string{"GET", "OPTIONS"}, 1},
 
 		// Deposit APIs
@@ -326,6 +347,7 @@ func startApi(router *mux.Router) {
 		{"/v1/network/overview", api.APINetworkOverviewV1, []string{"GET", "OPTIONS"}, 1},
 		{"/v1/network/forks", api.APINetworkForksV1, []string{"GET", "OPTIONS"}, 1},
 		{"/v1/network/splits", api.APINetworkSplitsV1, []string{"GET", "OPTIONS"}, 1},
+		{"/v1/network/client_head_forks", api.APINetworkClientHeadForksV1, []string{"GET", "OPTIONS"}, 1},
 
 		// Client APIs
 		{"/v1/clients/execution", api.APIExecutionClients, []string{"GET", "OPTIONS"}, 1},

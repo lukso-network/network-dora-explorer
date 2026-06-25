@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -10,14 +11,14 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/indexer/beacon"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
 	"github.com/ethpandaops/dora/utils"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -210,9 +211,10 @@ func buildValidatorsActivityPageData(pageIdx uint64, pageSize uint64, sortOrder 
 	}
 
 	if groupBy == 4 && exactWithdrawalSearch {
-		filteredValidators, _ := services.GlobalBeaconService.GetValidatorsByWithdrawalFilter(dbtypes.ValidatorFilter{
+		filteredValidators, _ := services.GlobalBeaconService.GetFilteredValidatorSet(context.Background(), &dbtypes.ValidatorFilter{
 			WithdrawalAddress: withdrawalAddressFilter,
 			WithdrawalCreds:   withdrawalCredsFilter,
+			OrderBy:           dbtypes.ValidatorOrderIndexAsc,
 		}, false)
 		for _, validator := range filteredValidators {
 			if validator.Validator == nil {

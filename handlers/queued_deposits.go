@@ -2,20 +2,23 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
+	"github.com/ethpandaops/go-eth2-client/spec/gloas"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 )
 
 // QueuedDeposits will return the "queued_deposits" page using a go template
@@ -89,8 +92,10 @@ func getQueuedDepositsPageData(pageIdx uint64, pageSize uint64, minIndex uint64,
 		FilterMaxAmount: maxAmount,
 	}
 	pageCacheKey := fmt.Sprintf("queued_deposits:%v:%v:%v:%v:%v:%v:%v", pageIdx, pageSize, minIndex, maxIndex, publickey, minAmount, maxAmount)
-	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(_ *services.FrontendCacheProcessingPage) interface{} {
-		return buildQueuedDepositsPageData(pageIdx, pageSize, minIndex, maxIndex, publickey, minAmount, maxAmount)
+	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
+		pageData, cacheTimeout := buildQueuedDepositsPageData(pageCall.CallCtx, pageIdx, pageSize, minIndex, maxIndex, publickey, minAmount, maxAmount)
+		pageCall.CacheTimeout = cacheTimeout
+		return pageData
 	})
 	if pageErr == nil && pageRes != nil {
 		resData, resOk := pageRes.(*models.QueuedDepositsPageData)
@@ -102,7 +107,7 @@ func getQueuedDepositsPageData(pageIdx uint64, pageSize uint64, minIndex uint64,
 	return pageData, pageErr
 }
 
-func buildQueuedDepositsPageData(pageIdx uint64, pageSize uint64, minIndex uint64, maxIndex uint64, publickey string, minAmount uint64, maxAmount uint64) *models.QueuedDepositsPageData {
+func buildQueuedDepositsPageData(ctx context.Context, pageIdx uint64, pageSize uint64, minIndex uint64, maxIndex uint64, publickey string, minAmount uint64, maxAmount uint64) (*models.QueuedDepositsPageData, time.Duration) {
 	chainState := services.GlobalBeaconService.GetChainState()
 	specs := chainState.GetSpecs()
 	pageData := &models.QueuedDepositsPageData{
@@ -114,6 +119,7 @@ func buildQueuedDepositsPageData(pageIdx uint64, pageSize uint64, minIndex uint6
 		MaxEffectiveBalance: specs.MaxEffectiveBalance,
 	}
 
+	cacheTimeout := 5 * time.Minute
 	if pageIdx == 1 {
 		pageData.IsDefaultPage = true
 	}
@@ -127,7 +133,7 @@ func buildQueuedDepositsPageData(pageIdx uint64, pageSize uint64, minIndex uint6
 		pageData.PrevPageIndex = pageIdx - 1
 	}
 
-	filteredQueue := services.GlobalBeaconService.GetFilteredQueuedDeposits(&services.QueuedDepositFilter{
+	filteredQueue := services.GlobalBeaconService.GetFilteredQueuedDeposits(ctx, &services.QueuedDepositFilter{
 		MinIndex:  minIndex,
 		MaxIndex:  maxIndex,
 		PublicKey: common.FromHex(publickey),
@@ -165,13 +171,13 @@ func buildQueuedDepositsPageData(pageIdx uint64, pageSize uint64, minIndex uint6
 	}
 
 	// Populate UrlParams for page jump functionality
-	pageData.UrlParams = make(map[string]string)
+	pageData.UrlParams = make([]models.UrlParam, 0)
 	for key, values := range filterArgs {
 		if len(values) > 0 {
-			pageData.UrlParams[key] = values[0]
+			pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{Key: key, Value: values[0]})
 		}
 	}
-	pageData.UrlParams["c"] = fmt.Sprintf("%v", pageData.PageSize)
+	pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{Key: "c", Value: fmt.Sprintf("%v", pageData.PageSize)})
 
 	pageData.FirstPageLink = fmt.Sprintf("/validators/queued_deposits?f&%v&c=%v", filterArgs.Encode(), pageData.PageSize)
 	pageData.PrevPageLink = fmt.Sprintf("/validators/queued_deposits?f&%v&c=%v&p=%v", filterArgs.Encode(), pageData.PageSize, pageData.PrevPageIndex)
@@ -195,7 +201,7 @@ func buildQueuedDepositsPageData(pageIdx uint64, pageSize uint64, minIndex uint6
 	}
 
 	txDetailsMap := map[uint64]*dbtypes.DepositTx{}
-	for _, txDetail := range db.GetDepositTxsByIndexes(depositIndexes) {
+	for _, txDetail := range db.GetDepositTxsByIndexes(ctx, depositIndexes) {
 		txDetailsMap[txDetail.Index] = txDetail
 	}
 
@@ -206,24 +212,55 @@ func buildQueuedDepositsPageData(pageIdx uint64, pageSize uint64, minIndex uint6
 	for i := start; i < end; i++ {
 		queueEntry := filteredQueue[i]
 
+		wdCreds := queueEntry.PendingDeposit.WithdrawalCredentials[:]
+		isBuilder := len(wdCreds) > 0 && wdCreds[0] == 0x03
+
+		// EpochEstimate is the churn-based epoch for normal deposits and the validator's
+		// withdrawable epoch for postponed ones; 0 means unknown.
+		var estimatedTime time.Time
+		if queueEntry.EpochEstimate > 0 {
+			estimatedTime = chainState.EpochToTime(queueEntry.EpochEstimate)
+		}
+
 		depositData := &models.QueuedDepositsPageDataDeposit{
 			QueuePosition:         queueEntry.QueuePos,
-			EstimatedTime:         chainState.EpochToTime(queueEntry.EpochEstimate),
+			EstimatedTime:         estimatedTime,
 			PublicKey:             queueEntry.PendingDeposit.Pubkey[:],
 			Amount:                uint64(queueEntry.PendingDeposit.Amount),
-			Withdrawalcredentials: queueEntry.PendingDeposit.WithdrawalCredentials[:],
+			Withdrawalcredentials: wdCreds,
+			IsBuilder:             isBuilder,
+			Postponed:             queueEntry.Postponed,
 		}
 
 		// Get validator status if exists
 		if validatorIdx, found := services.GlobalBeaconService.GetValidatorIndexByPubkey(phase0.BLSPubKey(depositData.PublicKey)); !found {
 			depositData.ValidatorStatus = "Deposited"
+		} else if uint64(validatorIdx)&services.BuilderIndexFlag != 0 {
+			builderIndex := uint64(validatorIdx) &^ services.BuilderIndexFlag
+			depositData.IsBuilder = true
+			depositData.ValidatorExists = true
+			depositData.ValidatorIndex = builderIndex
+			depositData.ValidatorName = services.GlobalBeaconService.GetValidatorName(uint64(validatorIdx))
+
+			builder := services.GlobalBeaconService.GetBuilderByIndex(gloas.BuilderIndex(builderIndex))
+			if builder == nil {
+				depositData.ValidatorStatus = "Deposited"
+			} else if builder.WithdrawableEpoch <= chainState.CurrentEpoch() {
+				depositData.ValidatorStatus = "Exited"
+			} else {
+				depositData.ValidatorStatus = "Active"
+			}
 		} else {
 			depositData.ValidatorExists = true
 			depositData.ValidatorIndex = uint64(validatorIdx)
+			depositData.ProjectedIndex = services.GlobalBeaconService.IsProjectedValidatorIndex(validatorIdx)
+			depositData.IsBuilder = false
 			depositData.ValidatorName = services.GlobalBeaconService.GetValidatorName(uint64(validatorIdx))
 
 			validator := services.GlobalBeaconService.GetValidatorByIndex(validatorIdx, false)
-			if strings.HasPrefix(validator.Status.String(), "pending") {
+			if validator == nil {
+				depositData.ValidatorStatus = "Deposited"
+			} else if strings.HasPrefix(validator.Status.String(), "pending") {
 				depositData.ValidatorStatus = "Pending"
 			} else if validator.Status == v1.ValidatorStateActiveOngoing {
 				depositData.ValidatorStatus = "Active"
@@ -255,7 +292,6 @@ func buildQueuedDepositsPageData(pageIdx uint64, pageSize uint64, minIndex uint6
 			if tx, txFound := txDetailsMap[depositData.Index]; txFound {
 				depositData.HasTransaction = true
 				depositData.TransactionHash = tx.TxHash
-				depositData.Withdrawalcredentials = tx.WithdrawalCredentials
 				depositData.TransactionDetails = &models.QueuedDepositsPageDataDepositTxDetails{
 					BlockNumber: tx.BlockNumber,
 					BlockHash:   fmt.Sprintf("%#x", tx.BlockRoot),
@@ -277,5 +313,5 @@ func buildQueuedDepositsPageData(pageIdx uint64, pageSize uint64, minIndex uint6
 	pageData.DepositsFrom = start + 1
 	pageData.DepositsTo = end
 	pageData.DepositCount = uint64(len(pageData.Deposits))
-	return pageData
+	return pageData, cacheTimeout
 }

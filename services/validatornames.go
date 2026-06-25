@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethpandaops/dora/clients/consensus"
 	"github.com/ethpandaops/dora/config"
@@ -20,6 +20,7 @@ import (
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/indexer/beacon"
 	"github.com/ethpandaops/dora/utils"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/jmoiron/sqlx"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/exp/maps"
@@ -29,6 +30,7 @@ import (
 var logger_vn = logrus.StandardLogger().WithField("module", "validator_names")
 
 type ValidatorNames struct {
+	ctx                   context.Context
 	beaconIndexer         *beacon.Indexer
 	chainState            *consensus.ChainState
 	loadingMutex          sync.Mutex
@@ -48,8 +50,9 @@ type validatorNameEntry struct {
 	name string
 }
 
-func NewValidatorNames(beaconIndexer *beacon.Indexer, chainState *consensus.ChainState) *ValidatorNames {
+func NewValidatorNames(ctx context.Context, beaconIndexer *beacon.Indexer, chainState *consensus.ChainState) *ValidatorNames {
 	validatorNames := &ValidatorNames{
+		ctx:           ctx,
 		beaconIndexer: beaconIndexer,
 		chainState:    chainState,
 	}
@@ -107,7 +110,7 @@ func (vn *ValidatorNames) runUpdater() error {
 	}
 
 	if needUpdate {
-		err := vn.UpdateDb()
+		err := vn.UpdateDb(vn.ctx)
 		if err != nil {
 			return err
 		}
@@ -139,11 +142,30 @@ func (vn *ValidatorNames) getDefaultValidatorNames() string {
 func (vn *ValidatorNames) resolveNames() (bool, error) {
 	logger_vn.Debugf("resolve validator names")
 
+	vn.namesMutex.RLock()
+	var namesByWithdrawalCopy map[common.Address]*validatorNameEntry
+	if vn.namesByWithdrawal != nil {
+		namesByWithdrawalCopy = maps.Clone(vn.namesByWithdrawal)
+	}
+	var namesByDepositOriginCopy map[common.Address]*validatorNameEntry
+	if vn.namesByDepositOrigin != nil {
+		namesByDepositOriginCopy = maps.Clone(vn.namesByDepositOrigin)
+	}
+	var namesByDepositTargetCopy map[common.Address]*validatorNameEntry
+	if vn.namesByDepositTarget != nil {
+		namesByDepositTargetCopy = maps.Clone(vn.namesByDepositTarget)
+	}
+	var resolvedNamesByIndexCopy map[uint64]*validatorNameEntry
+	if vn.resolvedNamesByIndex != nil {
+		resolvedNamesByIndexCopy = maps.Clone(vn.resolvedNamesByIndex)
+	}
+	vn.namesMutex.RUnlock()
+
 	newResolvedNames := map[uint64]*validatorNameEntry{}
 	hasUpdates := false
 	addResolved := func(index uint64, name *validatorNameEntry) {
 		newResolvedNames[index] = name
-		if vn.resolvedNamesByIndex[index] != name {
+		if resolvedNamesByIndexCopy[index] != name {
 			hasUpdates = true
 		}
 	}
@@ -151,12 +173,12 @@ func (vn *ValidatorNames) resolveNames() (bool, error) {
 	canonicalForkIds := GlobalBeaconService.GetCanonicalForkIds()
 
 	// resolve names by withdrawal address
-	for wdAddr, name := range vn.namesByWithdrawal {
+	for wdAddr, name := range namesByWithdrawalCopy {
 		if name == nil {
 			continue
 		}
 
-		validators, _ := GlobalBeaconService.GetFilteredValidatorSet(&dbtypes.ValidatorFilter{
+		validators, _ := GlobalBeaconService.GetFilteredValidatorSet(vn.ctx, &dbtypes.ValidatorFilter{
 			WithdrawalAddress: wdAddr[:],
 		}, false)
 		for _, validator := range validators {
@@ -165,18 +187,18 @@ func (vn *ValidatorNames) resolveNames() (bool, error) {
 	}
 
 	// resolve names by depositor address
-	for address := range vn.namesByDepositOrigin {
+	for address := range namesByDepositOriginCopy {
 		offset := uint64(0)
 		pageSize := uint64(5000)
 
 		for {
-			deposits, depositCount, _ := db.GetDepositTxsFiltered(offset, uint32(pageSize), canonicalForkIds, &dbtypes.DepositTxFilter{
+			deposits, depositCount, _ := db.GetDepositTxsFiltered(vn.ctx, offset, uint32(pageSize), canonicalForkIds, &dbtypes.DepositTxFilter{
 				Address: address[:],
 			})
 			for _, deposit := range deposits {
 				validatorIndex, found := vn.beaconIndexer.GetValidatorIndexByPubkey(phase0.BLSPubKey(deposit.PublicKey))
 				if found {
-					addResolved(uint64(validatorIndex), vn.namesByDepositOrigin[address])
+					addResolved(uint64(validatorIndex), namesByDepositOriginCopy[address])
 				}
 			}
 
@@ -188,18 +210,18 @@ func (vn *ValidatorNames) resolveNames() (bool, error) {
 	}
 
 	// resolve names by deposit target address
-	for address := range vn.namesByDepositTarget {
+	for address := range namesByDepositTargetCopy {
 		offset := uint64(0)
 		pageSize := uint64(5000)
 
 		for {
-			deposits, depositCount, _ := db.GetDepositTxsFiltered(offset, uint32(pageSize), canonicalForkIds, &dbtypes.DepositTxFilter{
+			deposits, depositCount, _ := db.GetDepositTxsFiltered(vn.ctx, offset, uint32(pageSize), canonicalForkIds, &dbtypes.DepositTxFilter{
 				TargetAddress: address[:],
 			})
 			for _, deposit := range deposits {
 				validatorIndex, found := vn.beaconIndexer.GetValidatorIndexByPubkey(phase0.BLSPubKey(deposit.PublicKey))
 				if found {
-					addResolved(uint64(validatorIndex), vn.namesByDepositTarget[address])
+					addResolved(uint64(validatorIndex), namesByDepositTargetCopy[address])
 				}
 			}
 
@@ -212,7 +234,7 @@ func (vn *ValidatorNames) resolveNames() (bool, error) {
 
 	if !hasUpdates {
 		// check for removed names
-		for index := range vn.resolvedNamesByIndex {
+		for index := range resolvedNamesByIndexCopy {
 			if newResolvedNames[index] == nil {
 				hasUpdates = true
 			}
@@ -220,7 +242,9 @@ func (vn *ValidatorNames) resolveNames() (bool, error) {
 	}
 
 	if hasUpdates {
+		vn.namesMutex.Lock()
 		vn.resolvedNamesByIndex = newResolvedNames
+		vn.namesMutex.Unlock()
 	}
 
 	return hasUpdates, nil
@@ -296,12 +320,18 @@ func (vn *ValidatorNames) LoadValidatorNames() chan bool {
 		vn.namesByDepositTarget = make(map[common.Address]*validatorNameEntry)
 		vn.namesMutex.Unlock()
 
+		if utils.Config.Frontend.ValidatorNamesInventory != "" {
+			err := vn.loadFromRangesApi(utils.Config.Frontend.ValidatorNamesInventory)
+			if err != nil {
+				logger_vn.WithError(err).Errorf("error while loading validator names inventory")
+			}
+		}
+
 		validatorNamesYaml := utils.Config.Frontend.ValidatorNamesYaml
 		if validatorNamesYaml == "" {
 			validatorNamesYaml = vn.getDefaultValidatorNames()
 		}
 
-		// load names
 		if strings.HasPrefix(validatorNamesYaml, "~internal/") {
 			err := vn.loadFromInternalYaml(validatorNamesYaml[10:])
 			if err != nil {
@@ -311,12 +341,6 @@ func (vn *ValidatorNames) LoadValidatorNames() chan bool {
 			err := vn.loadFromYaml(validatorNamesYaml)
 			if err != nil {
 				logger_vn.WithError(err).Errorf("error while loading validator names from yaml")
-			}
-		}
-		if utils.Config.Frontend.ValidatorNamesInventory != "" {
-			err := vn.loadFromRangesApi(utils.Config.Frontend.ValidatorNamesInventory)
-			if err != nil {
-				logger_vn.WithError(err).Errorf("error while loading validator names inventory")
 			}
 		}
 	}()
@@ -444,7 +468,7 @@ func (vn *ValidatorNames) loadFromRangesApi(apiUrl string) error {
 	return nil
 }
 
-func (vn *ValidatorNames) UpdateDb() error {
+func (vn *ValidatorNames) UpdateDb(ctx context.Context) error {
 	vn.namesMutex.RLock()
 	nameRows := make([]*dbtypes.ValidatorName, 0)
 	hasName := map[uint64]bool{}
@@ -486,7 +510,7 @@ func (vn *ValidatorNames) UpdateDb() error {
 
 		// get existing db entries
 		dbNamesMap := map[uint64]string{}
-		for _, dbName := range db.GetValidatorNames(lastIndex, maxIndex) {
+		for _, dbName := range db.GetValidatorNames(ctx, lastIndex, maxIndex) {
 			dbNamesMap[dbName.Index] = dbName.Name
 		}
 
@@ -508,14 +532,14 @@ func (vn *ValidatorNames) UpdateDb() error {
 
 		err := db.RunDBTransaction(func(tx *sqlx.Tx) error {
 			if len(updateNames) > 0 {
-				err := db.InsertValidatorNames(updateNames, tx)
+				err := db.InsertValidatorNames(ctx, tx, updateNames)
 				if err != nil {
 					logger_vn.WithError(err).Errorf("error while adding validator names to db")
 				}
 			}
 
 			if len(removeIndexes) > 0 {
-				err := db.DeleteValidatorNames(removeIndexes, tx)
+				err := db.DeleteValidatorNames(ctx, tx, removeIndexes)
 				if err != nil {
 					logger_vn.WithError(err).Errorf("error while deleting validator names from db")
 				}

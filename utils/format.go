@@ -13,6 +13,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/prysmaticlabs/go-bitfield"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
@@ -33,6 +34,11 @@ func FormatETHFromGweiShort(gwei uint64) string {
 	return fmt.Sprintf("%.4f", float64(gwei)/math.Pow10(9))
 }
 
+func FormatETHFromGweiP(gwei uint64, precision int) string {
+	f := fmt.Sprintf("%%.%df ETH", precision)
+	return fmt.Sprintf(f, float64(gwei)/math.Pow10(9))
+}
+
 func FormatFullEthFromGwei(gwei uint64) string {
 	return fmt.Sprintf("%v LYX", uint64(float64(gwei)/math.Pow10(9)))
 }
@@ -47,6 +53,16 @@ func FormatFloat(num float64, precision int) string {
 	s := strings.TrimRight(strings.TrimRight(p.Sprintf(f, num), "0"), ".")
 	r := []rune(p.Sprintf(s, num))
 	return string(r)
+}
+
+// FormatTokenAmount formats a token amount with full precision, trimming trailing zeros
+func FormatTokenAmount(amount float64, symbol string) string {
+	// Format with high precision and trim trailing zeros
+	formatted := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.18f", amount), "0"), ".")
+	if symbol != "" {
+		return formatted + " " + symbol
+	}
+	return formatted
 }
 
 func FormatBaseFee(weiValue uint64) template.HTML {
@@ -79,11 +95,98 @@ func FormatBlobFeeDifference(eip7918Value, originalValue uint64) template.HTML {
 }
 
 func FormatTransactionValue(ethValue float64) template.HTML {
-	// Convert LYX value to wei (1 LYX = 1e18 wei)
-	weiValue := uint64(ethValue * 1e18)
+	// Convert value to wei using big.Float to avoid uint64 overflow
+	weiBigFloat := new(big.Float).SetFloat64(ethValue)
+	weiBigFloat.Mul(weiBigFloat, new(big.Float).SetFloat64(1e18))
 
-	// Use the same formatting logic as FormatBaseFee
-	return FormatBaseFee(weiValue)
+	// If less than 100,000 wei, show in wei
+	if weiBigFloat.Cmp(new(big.Float).SetFloat64(100000)) < 0 {
+		weiInt, _ := weiBigFloat.Int(nil)
+		return template.HTML(string(FormatAddCommas(weiInt.Uint64())) + " wei")
+	}
+
+	// Convert to gwei
+	gweiFloat, _ := new(big.Float).Quo(
+		new(big.Float).Copy(weiBigFloat),
+		new(big.Float).SetFloat64(1e9),
+	).Float64()
+
+	// If less than 100,000 gwei, show in gwei with 6 decimals, trimmed
+	if gweiFloat < 100000 {
+		formatted := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.6f", gweiFloat), "0"), ".")
+		return template.HTML(formatted + " gwei")
+	}
+
+	// Show in ETH for large values with 6 decimals, trimmed
+	formatted := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.6f", ethValue), "0"), ".")
+	return template.HTML(formatted + " ETH")
+}
+
+// FormatTransactionFee formats a transaction fee in ETH with intelligent rounding.
+// Cuts off decimals after 3 non-zero decimals, with min 6 decimals.
+// Examples: 0.123456789 => 0.123456, 0.000023456244 => 0.0000234
+// Does not include the unit (designed for table columns where space is limited).
+func FormatTransactionFee(ethValue float64) template.HTML {
+	formatted := formatWithIntelligentRounding(ethValue)
+	return template.HTML(formatted)
+}
+
+// formatWithIntelligentRounding formats a float with intelligent rounding:
+// - Minimum 6 decimal places
+// - Cut off after 3 non-zero decimals (counting from first non-zero)
+// Examples: 0.123456789 => 0.123456, 0.000023456244 => 0.0000234
+func formatWithIntelligentRounding(value float64) string {
+	if value == 0 {
+		return "0"
+	}
+
+	// Format with high precision first
+	fullStr := fmt.Sprintf("%.18f", value)
+
+	// Find the decimal point
+	dotIdx := strings.Index(fullStr, ".")
+	if dotIdx == -1 {
+		return strings.TrimRight(fullStr, "0")
+	}
+
+	intPart := fullStr[:dotIdx]
+	decPart := fullStr[dotIdx+1:]
+
+	// Find position of first non-zero digit in decimal part
+	firstNonZero := -1
+	for i, c := range decPart {
+		if c != '0' {
+			firstNonZero = i
+			break
+		}
+	}
+
+	// If no non-zero decimals, return integer part
+	if firstNonZero == -1 {
+		return intPart
+	}
+
+	// Calculate how many decimals to keep:
+	// - At least 6 decimal places
+	// - Or position of first non-zero + 3 significant digits
+	minDecimals := 6
+	significantEnd := firstNonZero + 3 // 3 significant digits after first non-zero
+
+	decimalsToKeep := minDecimals
+	if significantEnd > decimalsToKeep {
+		decimalsToKeep = significantEnd
+	}
+
+	// Ensure we don't exceed available decimals
+	if decimalsToKeep > len(decPart) {
+		decimalsToKeep = len(decPart)
+	}
+
+	// Trim and format
+	result := intPart + "." + decPart[:decimalsToKeep]
+	result = strings.TrimRight(strings.TrimRight(result, "0"), ".")
+
+	return result
 }
 
 func formatPercentageAlert(num float64, precision int, warnBelow float64, errBelow float64) template.HTML {
@@ -334,8 +437,13 @@ func trimAmount(amount *big.Int, unitDigits int, maxPreCommaDigitsBeforeTrim int
 
 func FormatEthBlockLink(blockNum uint64) template.HTML {
 	caption := FormatAddCommas(blockNum)
+	// Use local link when execution indexer is enabled
+	if Config.ExecutionIndexer.Enabled {
+		return template.HTML(fmt.Sprintf(`<a href="/block/%d">%v</a>`, blockNum, caption))
+	}
+	// Fall back to external explorer link
 	if Config.Frontend.EthExplorerLink != "" {
-		link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "block", strconv.FormatUint(uint64(blockNum), 10))
+		link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "block", strconv.FormatUint(blockNum, 10))
 		if err == nil {
 			return template.HTML(fmt.Sprintf(`<a href="%v">%v</a>`, link, caption))
 		}
@@ -345,6 +453,11 @@ func FormatEthBlockLink(blockNum uint64) template.HTML {
 
 func FormatEthBlockHashLink(blockHash []byte) template.HTML {
 	caption := fmt.Sprintf("0x%x", blockHash)
+	// Use local link when execution indexer is enabled
+	if Config.ExecutionIndexer.Enabled {
+		return template.HTML(fmt.Sprintf(`<a href="/block/%s">%s</a>`, caption, caption))
+	}
+	// Fall back to external explorer link
 	if Config.Frontend.EthExplorerLink != "" {
 		link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "block", caption)
 		if err == nil {
@@ -355,35 +468,346 @@ func FormatEthBlockHashLink(blockHash []byte) template.HTML {
 }
 
 func FormatEthAddressLink(address []byte) template.HTML {
-	caption := common.BytesToAddress(address).String()
+	if len(address) == 0 {
+		return template.HTML("")
+	}
+
+	fullAddr := common.BytesToAddress(address).Hex()
+	// Short format: 4 bytes on each side (0x + 8 chars + … + 8 chars)
+	shortAddr := fullAddr[:10] + "…" + fullAddr[len(fullAddr)-8:]
+
+	// Use local link when execution indexer is enabled
+	if Config.ExecutionIndexer.Enabled {
+		return template.HTML(fmt.Sprintf(`<a href="/address/%s" data-bs-toggle="tooltip" title="%s">%s</a>`,
+			fullAddr, fullAddr, shortAddr))
+	}
+
+	// Fall back to external explorer link
 	if Config.Frontend.EthExplorerLink != "" {
-		link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "address", caption)
+		link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "address", fullAddr)
 		if err == nil {
-			return template.HTML(fmt.Sprintf(`<a href="%v">%v</a>`, link, caption))
+			return template.HTML(fmt.Sprintf(`<a href="%v" data-bs-toggle="tooltip" title="%s">%v</a>`,
+				link, fullAddr, shortAddr))
 		}
 	}
-	return template.HTML(caption)
+
+	return template.HTML(fmt.Sprintf(`<span data-bs-toggle="tooltip" title="%s">%s</span>`, fullAddr, shortAddr))
 }
 
 func FormatEthTransactionLink(hash []byte, width uint64) template.HTML {
-	txhash := common.Hash(hash).String()
-	caption := txhash
-	if width > 0 {
-		caption = caption[:width] + "…"
+	if len(hash) == 0 {
+		return template.HTML("")
 	}
 
+	txhash := common.Hash(hash).String()
+	caption := txhash
+	if width > 0 && len(txhash) > int(width)+1 {
+		caption = txhash[:width] + "…"
+	}
+
+	// Use local link when execution indexer is enabled
+	if Config.ExecutionIndexer.Enabled {
+		return template.HTML(fmt.Sprintf(`<a href="/tx/%s" data-bs-toggle="tooltip" title="%s">%s</a>`,
+			txhash, txhash, caption))
+	}
+
+	// Fall back to external explorer link
 	if Config.Frontend.EthExplorerLink != "" {
 		link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "tx", txhash)
 		if err == nil {
-			return template.HTML(fmt.Sprintf(`<a href="%v">%v</a>`, link, caption))
+			return template.HTML(fmt.Sprintf(`<a href="%v" data-bs-toggle="tooltip" title="%s">%v</a>`,
+				link, txhash, caption))
 		}
 	}
-	return template.HTML(caption)
+
+	return template.HTML(fmt.Sprintf(`<span data-bs-toggle="tooltip" title="%s">%s</span>`, txhash, caption))
 }
 
 func FormatEthAddress(address []byte) template.HTML {
 	caption := common.BytesToAddress(address).String()
 	return template.HTML(caption)
+}
+
+// FormatEthAddressShort formats an Ethereum address in short form: 0xcBA360df…60ebC2d32
+// The bytes parameter specifies how many bytes (hex char pairs) to show on each side (default 4)
+func FormatEthAddressShort(address []byte, byteCount ...int) template.HTML {
+	if len(address) == 0 {
+		return template.HTML("")
+	}
+
+	fullAddr := common.BytesToAddress(address).Hex()
+	showBytes := 4 // default: 4 bytes = 8 hex chars
+	if len(byteCount) > 0 && byteCount[0] > 0 {
+		showBytes = byteCount[0]
+	}
+
+	// Hex chars to show on each side (2 hex chars per byte)
+	hexChars := showBytes * 2
+
+	// fullAddr is like "0x1234567890abcdef1234567890abcdef12345678" (42 chars)
+	// We want "0x" + first hexChars + "…" + last hexChars
+	if len(fullAddr) <= 2+hexChars*2+1 {
+		return template.HTML(template.HTMLEscapeString(fullAddr))
+	}
+
+	return template.HTML(template.HTMLEscapeString(fullAddr[:2+hexChars]) + "…" + template.HTMLEscapeString(fullAddr[len(fullAddr)-hexChars:]))
+}
+
+// FormatEthAddressShortLink formats an Ethereum address as a short link with optional contract icon
+// isContract: whether to show the contract icon prefix
+// byteCount: how many bytes (hex char pairs) to show on each side (default 4)
+func FormatEthAddressShortLink(address []byte, isContract bool, byteCount ...int) template.HTML {
+	if len(address) == 0 {
+		return template.HTML(`<span class="text-muted">-</span>`)
+	}
+
+	fullAddr := common.BytesToAddress(address).Hex()
+	showBytes := 4 // default: 4 bytes = 8 hex chars
+	if len(byteCount) > 0 && byteCount[0] > 0 {
+		showBytes = byteCount[0]
+	}
+
+	// Format the short address
+	hexChars := showBytes * 2
+	shortAddr := fullAddr
+	if len(fullAddr) > 2+hexChars*2+1 {
+		shortAddr = fullAddr[:2+hexChars] + "…" + fullAddr[len(fullAddr)-hexChars:]
+	}
+
+	// Build the HTML
+	var result string
+	if isContract {
+		result = `<i class="fas fa-file-contract text-muted" style="font-size:0.8rem;margin-right:0.2rem" data-bs-toggle="tooltip" title="Contract"></i>`
+	}
+
+	// Use local link when execution indexer is enabled
+	if Config.ExecutionIndexer.Enabled {
+		result += fmt.Sprintf(`<a href="/address/%s" data-bs-toggle="tooltip" title="%s">%s</a>`,
+			fullAddr, fullAddr, shortAddr)
+	} else if Config.Frontend.EthExplorerLink != "" {
+		// Fall back to external explorer link
+		link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "address", fullAddr)
+		if err == nil {
+			result += fmt.Sprintf(`<a href="%v" data-bs-toggle="tooltip" title="%s">%v</a>`,
+				link, fullAddr, shortAddr)
+		} else {
+			result += fmt.Sprintf(`<span data-bs-toggle="tooltip" title="%s">%s</span>`, fullAddr, shortAddr)
+		}
+	} else {
+		// No link available
+		result += fmt.Sprintf(`<span data-bs-toggle="tooltip" title="%s">%s</span>`, fullAddr, shortAddr)
+	}
+
+	return template.HTML(result)
+}
+
+// FormatHexBytes formats a byte slice as a 0x-prefixed hex string
+func FormatHexBytes(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("0x%x", data)
+}
+
+// FormatWeiAmount formats a wei amount (passed as a base-10 string) into
+// wei/gwei/ETH depending on magnitude, keeping precision (no float rounding).
+//
+// Heuristics mirror FormatBaseFee:
+// - < 100000 wei -> show in wei
+// - < 100000 gwei -> show in gwei (6 decimals, trimmed)
+// - otherwise -> show in ETH (6 decimals, trimmed)
+func FormatWeiAmount(weiStr string) template.HTML {
+	weiStr = strings.TrimSpace(weiStr)
+	if weiStr == "" {
+		return template.HTML("0 wei")
+	}
+
+	wei := new(big.Int)
+	if _, ok := wei.SetString(weiStr, 10); !ok {
+		return template.HTML(template.HTMLEscapeString(weiStr))
+	}
+
+	// < 100000 wei
+	if wei.Cmp(big.NewInt(100000)) < 0 {
+		return template.HTML(template.HTMLEscapeString(wei.String()) + " wei")
+	}
+
+	// gwei = wei / 1e9
+	gweiDen := big.NewInt(1_000_000_000)
+	gweiRat := new(big.Rat).SetFrac(wei, gweiDen)
+	// < 100000 gwei
+	if gweiRat.Cmp(new(big.Rat).SetInt64(100000)) < 0 {
+		s := gweiRat.FloatString(6)
+		s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+		return template.HTML(template.HTMLEscapeString(s) + " gwei")
+	}
+
+	// eth = wei / 1e18
+	ethDen := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	ethRat := new(big.Rat).SetFrac(wei, ethDen)
+	s := ethRat.FloatString(6)
+	s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+	return template.HTML(template.HTMLEscapeString(s) + " ETH")
+}
+
+// FormatWeiDeltaAmount formats a signed wei delta (base-10 string) into
+// wei/gwei/ETH with a + or - prefix (no float rounding).
+func FormatWeiDeltaAmount(diffWeiStr string) template.HTML {
+	diffWeiStr = strings.TrimSpace(diffWeiStr)
+	if diffWeiStr == "" {
+		return template.HTML("0 wei")
+	}
+
+	diff := new(big.Int)
+	if _, ok := diff.SetString(diffWeiStr, 10); !ok {
+		return template.HTML(template.HTMLEscapeString(diffWeiStr))
+	}
+
+	if diff.Sign() == 0 {
+		return template.HTML("0 wei")
+	}
+
+	sign := "+"
+	if diff.Sign() < 0 {
+		sign = "-"
+	}
+
+	abs := new(big.Int).Abs(diff)
+
+	// reuse the same unit heuristics as FormatWeiAmount
+	if abs.Cmp(big.NewInt(100000)) < 0 {
+		return template.HTML(sign + template.HTMLEscapeString(abs.String()) + " wei")
+	}
+
+	gweiDen := big.NewInt(1_000_000_000)
+	gweiRat := new(big.Rat).SetFrac(abs, gweiDen)
+	if gweiRat.Cmp(new(big.Rat).SetInt64(100000)) < 0 {
+		s := gweiRat.FloatString(6)
+		s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+		return template.HTML(sign + template.HTMLEscapeString(s) + " gwei")
+	}
+
+	ethDen := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
+	ethRat := new(big.Rat).SetFrac(abs, ethDen)
+	s := ethRat.FloatString(6)
+	s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+	return template.HTML(sign + template.HTMLEscapeString(s) + " ETH")
+}
+
+// FormatHexBytesShort formats bytes as a 0x-prefixed hex string truncated in the middle:
+// e.g. 0x1234abcd…c0ffee. The bytes parameter specifies how many bytes (hex pairs)
+// to show on each side (default 4).
+func FormatHexBytesShort(data []byte, byteCount ...int) template.HTML {
+	if len(data) == 0 {
+		return template.HTML(`<span class="text-muted">-</span>`)
+	}
+
+	full := FormatHexBytes(data)
+	showBytes := 4
+	if len(byteCount) > 0 && byteCount[0] > 0 {
+		showBytes = byteCount[0]
+	}
+	hexChars := showBytes * 2
+
+	// full is like "0x..." with 2+2*len(data) chars
+	if len(full) <= 2+hexChars*2+1 {
+		return template.HTML(fmt.Sprintf(`<span data-bs-toggle="tooltip" title="%s">%s</span>`,
+			template.HTMLEscapeString(full), template.HTMLEscapeString(full)))
+	}
+
+	short := full[:2+hexChars] + "…" + full[len(full)-hexChars:]
+	return template.HTML(fmt.Sprintf(`<span data-bs-toggle="tooltip" title="%s">%s</span>`,
+		template.HTMLEscapeString(full), template.HTMLEscapeString(short)))
+}
+
+// FormatNFTTokenID formats a byte slice as a decimal NFT token ID
+func FormatNFTTokenID(data []byte) string {
+	if len(data) == 0 {
+		return "0"
+	}
+	tokenID := new(big.Int).SetBytes(data)
+	return tokenID.String()
+}
+
+// FormatEthAddressFull returns the full 0x-prefixed Ethereum address from bytes
+func FormatEthAddressFull(address []byte) string {
+	if len(address) == 0 {
+		return ""
+	}
+	return common.BytesToAddress(address).Hex()
+}
+
+// FormatEthAddressFullLink returns the full Ethereum address with a link
+func FormatEthAddressFullLink(address []byte) template.HTML {
+	if len(address) == 0 {
+		return template.HTML("")
+	}
+
+	fullAddr := common.BytesToAddress(address).Hex()
+
+	// Use local link when execution indexer is enabled
+	if Config.ExecutionIndexer.Enabled {
+		return template.HTML(fmt.Sprintf(`<a href="/address/%s">%s</a>`, fullAddr, fullAddr))
+	}
+
+	// Fall back to external explorer link
+	if Config.Frontend.EthExplorerLink != "" {
+		link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "address", fullAddr)
+		if err == nil {
+			return template.HTML(fmt.Sprintf(`<a href="%v">%v</a>`, link, fullAddr))
+		}
+	}
+
+	return template.HTML(fullAddr)
+}
+
+// FormatEthHashShort formats an Ethereum hash (tx hash, block hash) in short form
+func FormatEthHashShort(hash []byte, byteCount ...int) template.HTML {
+	if len(hash) == 0 {
+		return template.HTML("")
+	}
+
+	fullHash := fmt.Sprintf("0x%x", hash)
+	showBytes := 6 // default: 6 bytes = 12 hex chars for hashes
+	if len(byteCount) > 0 && byteCount[0] > 0 {
+		showBytes = byteCount[0]
+	}
+
+	hexChars := showBytes * 2
+	if len(fullHash) <= 2+hexChars*2+1 {
+		return template.HTML(template.HTMLEscapeString(fullHash))
+	}
+
+	return template.HTML(template.HTMLEscapeString(fullHash[:2+hexChars]) + "…" + template.HTMLEscapeString(fullHash[len(fullHash)-hexChars:]))
+}
+
+// FormatContractCreationLink formats a link for a contract creation transaction
+// Shows "New Contract" badge linking to the created contract address
+func FormatContractCreationLink(fromAddr []byte, nonce uint64) template.HTML {
+	createdAddr := crypto.CreateAddress(common.BytesToAddress(fromAddr), nonce)
+	fullAddr := createdAddr.Hex()
+	shortAddr := fullAddr[:2+8] + "…" + fullAddr[len(fullAddr)-8:]
+
+	icon := `<i class="fas fa-plus-circle text-success" style="font-size:0.8rem;margin-right:0.2rem" data-bs-toggle="tooltip" title="Contract Creation"></i>`
+
+	// Use local link when execution indexer is enabled
+	if Config.ExecutionIndexer.Enabled {
+		return template.HTML(fmt.Sprintf(`%s<a href="/address/%s" data-bs-toggle="tooltip" title="%s">%s</a>`,
+			icon, fullAddr, fullAddr, shortAddr))
+	}
+
+	// Fall back to external explorer link
+	if Config.Frontend.EthExplorerLink != "" {
+		link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "address", fullAddr)
+		if err == nil {
+			return template.HTML(fmt.Sprintf(`%s<a href="%v" data-bs-toggle="tooltip" title="%s">%v</a>`,
+				icon, link, fullAddr, shortAddr))
+		}
+	}
+
+	// No link available
+	return template.HTML(fmt.Sprintf(`%s<span data-bs-toggle="tooltip" title="%s">%s</span>`,
+		icon, fullAddr, shortAddr))
 }
 
 func FormatValidator(index uint64, name string) template.HTML {
@@ -413,11 +837,104 @@ func formatValidator(index uint64, name string, icon string, withIndex bool) tem
 	return template.HTML(fmt.Sprintf("<span class=\"validator-label validator-index\"><i class=\"fas %v\"></i> <a href=\"/validator/%v\">%v</a></span>", icon, index, index))
 }
 
+// FormatProposerWithBuildSource renders a proposer label whose leading icon
+// reflects the payload build source on Gloas+ blocks: a house for self-built
+// payloads and a hard-hat (linking to the builder) for builder-built payloads.
+// Pre-Gloas blocks (hasBuilder == false) fall back to the default validator icon.
+//
+// Scheduled/missing slots (status == 0) and unknown proposers have no
+// determinable build source and are rendered without any leading icon.
+func FormatProposerWithBuildSource(status uint8, index uint64, name string, hasBuilder bool, builderIndex uint64, builderURL string) template.HTML {
+	if status == 0 || index == math.MaxInt64 {
+		if index == math.MaxInt64 {
+			return template.HTML(`<span class="validator-label validator-index">unknown</span>`)
+		}
+		if name != "" {
+			return template.HTML(fmt.Sprintf(`<span class="validator-label validator-name"><a href="/validator/%v">%v</a></span>`, index, html.EscapeString(name)))
+		}
+		return template.HTML(fmt.Sprintf(`<span class="validator-label validator-index"><a href="/validator/%v">%v</a></span>`, index, index))
+	}
+
+	if !hasBuilder {
+		return FormatValidator(index, name)
+	}
+
+	var iconHTML string
+	if builderIndex == math.MaxUint64 {
+		// self-built payload
+		iconHTML = `<i class="fas fa-house mr-2" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Self-built payload"></i>`
+	} else {
+		// builder-built payload - link the icon to the builder URL when known,
+		// otherwise to the internal builder page
+		builderLink := fmt.Sprintf("/builder/%v", builderIndex)
+		external := ""
+		if builderURL != "" {
+			builderLink = html.EscapeString(builderURL)
+			external = ` target="_blank" rel="noopener noreferrer"`
+		}
+		iconHTML = fmt.Sprintf(`<a href="%v"%v class="builder-source-link" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Builder-built payload (builder %v)"><i class="fas fa-hard-hat mr-2"></i></a>`, builderLink, external, builderIndex)
+	}
+
+	nameLabel := fmt.Sprintf("%v", index)
+	labelClass := "validator-index"
+	if name != "" {
+		nameLabel = html.EscapeString(name)
+		labelClass = "validator-name"
+	}
+	return template.HTML(fmt.Sprintf(`<span class="validator-label %v">%v <a href="/validator/%v">%v</a></span>`, labelClass, iconHTML, index, nameLabel))
+}
+
 func FormatValidatorNameWithIndex(index uint64, name string) template.HTML {
 	if name != "" {
 		return template.HTML(fmt.Sprintf("<span class=\"validator-label validator-name\">%v (%v)</span>", html.EscapeString(name), index))
 	}
 	return template.HTML(fmt.Sprintf("<span class=\"validator-label validator-index\">%v</span>", index))
+}
+
+func FormatBuilder(index uint64, name string) template.HTML {
+	return formatBuilder(index, name, "", "fa-hard-hat mr-2", false)
+}
+
+// FormatInactiveBuilder renders a builder whose index has been reused by a different builder
+// (EIP-8282). Since the index no longer identifies this pubkey, it links to the details page by
+// pubkey instead of by index.
+func FormatInactiveBuilder(pubkey []byte) template.HTML {
+	return template.HTML(fmt.Sprintf("<span class=\"builder-label builder-index\"><i class=\"fas fa-hard-hat mr-2\"></i> <a href=\"/builder/0x%x\" data-bs-toggle=\"tooltip\" data-bs-placement=\"top\" data-bs-title=\"This builder's index was reused by a different builder\">(inactive)</a></span>", pubkey))
+}
+
+func FormatBuilderWithIndex(index uint64, name string) template.HTML {
+	return formatBuilder(index, name, "", "fa-hard-hat mr-2", true)
+}
+
+func FormatBuilderWithURL(index uint64, name string, externalURL string) template.HTML {
+	return formatBuilder(index, name, externalURL, "fa-hard-hat mr-2", false)
+}
+
+func FormatBuilderWithIndexAndURL(index uint64, name string, externalURL string) template.HTML {
+	return formatBuilder(index, name, externalURL, "fa-hard-hat mr-2", true)
+}
+
+func formatBuilder(index uint64, name string, externalURL string, icon string, withIndex bool) template.HTML {
+	if index == math.MaxUint64 {
+		// self-built blocks have no builder; use the house icon (matches the proposer build-source icon)
+		return template.HTML("<span class=\"builder-label builder-index\"><i class=\"fas fa-house mr-2\"></i> Self-built</span>")
+	}
+
+	externalLink := ""
+	if externalURL != "" {
+		externalLink = fmt.Sprintf(` <a href="%v" target="_blank" rel="noopener noreferrer" class="builder-external-link text-muted ms-1" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="Open buildoor instance"><i class="fas fa-external-link-alt"></i></a>`, html.EscapeString(externalURL))
+	}
+
+	if name != "" {
+		var nameLabel string
+		if withIndex {
+			nameLabel = fmt.Sprintf("%v (%v)", html.EscapeString(name), index)
+		} else {
+			nameLabel = html.EscapeString(name)
+		}
+		return template.HTML(fmt.Sprintf("<span class=\"builder-label builder-name\"><i class=\"fas %v\"></i> <a href=\"/builder/%v\">%v</a>%v</span>", icon, index, nameLabel, externalLink))
+	}
+	return template.HTML(fmt.Sprintf("<span class=\"builder-label builder-index\"><i class=\"fas %v\"></i> <a href=\"/builder/%v\">%v</a>%v</span>", icon, index, index, externalLink))
 }
 
 func FormatRecentTimeShort(ts time.Time) template.HTML {
@@ -446,12 +963,71 @@ func FormatGraffiti(graffiti []byte) template.HTML {
 	return template.HTML(fmt.Sprintf("<span class=\"graffiti-label\" data-graffiti=\"%#x\">%s</span>", graffiti, html.EscapeString(string(graffiti))))
 }
 
+// FormatSlotStatusTooltip returns "Block: <X>, Payload: <Y>" for the
+// status pill on slot list views. Accepts the raw enum codes used in
+// dbtypes.SlotStatus / dbtypes.PayloadStatus; widened to any so the
+// same template helper can be called from models that store status as
+// uint8 (filtered views) or uint64 (index page).
+func FormatSlotStatusTooltip(blockStatus, payloadStatus any) string {
+	asInt := func(v any) int64 {
+		switch x := v.(type) {
+		case uint8:
+			return int64(x)
+		case uint16:
+			return int64(x)
+		case uint32:
+			return int64(x)
+		case uint64:
+			return int64(x)
+		case int8:
+			return int64(x)
+		case int16:
+			return int64(x)
+		case int32:
+			return int64(x)
+		case int64:
+			return x
+		case int:
+			return int64(x)
+		}
+		return -1
+	}
+
+	var bs string
+	switch asInt(blockStatus) {
+	case 0:
+		bs = "Missed"
+	case 1:
+		bs = "Canonical"
+	case 2:
+		bs = "Orphaned"
+	default:
+		bs = "Unknown"
+	}
+
+	var ps string
+	switch asInt(payloadStatus) {
+	case 0:
+		ps = "Missing"
+	case 1:
+		ps = "Revealed"
+	case 2:
+		ps = "Orphaned"
+	default:
+		ps = "Unknown"
+	}
+
+	return "Block: " + bs + "<br>Payload: " + ps
+}
+
 func formatWithdrawalHash(hash []byte) template.HTML {
 	var colorClass string
 	if hash[0] == 0x01 {
 		colorClass = "text-success"
 	} else if hash[0] == 0x02 {
 		colorClass = "text-info"
+	} else if hash[0] == 0x03 {
+		colorClass = "text-primary"
 	} else {
 		colorClass = "text-warning"
 	}
@@ -464,10 +1040,21 @@ func FormatWithdawalCredentials(hash []byte) template.HTML {
 		return "INVALID CREDENTIALS"
 	}
 
-	if (hash[0] == 0x01 || hash[0] == 0x02) && Config.Frontend.EthExplorerLink != "" {
-		link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "address", fmt.Sprintf("0x%x", hash[12:]))
-		if err == nil {
-			return template.HTML(fmt.Sprintf(`<a href="%v">%v</a>`, link, formatWithdrawalHash(hash)))
+	// For 0x01, 0x02 or 0x03 credentials, link to the address
+	if hash[0] == 0x01 || hash[0] == 0x02 || hash[0] == 0x03 {
+		addr := fmt.Sprintf("0x%x", hash[12:])
+
+		// Use local link when execution indexer is enabled
+		if Config.ExecutionIndexer.Enabled {
+			return template.HTML(fmt.Sprintf(`<a href="/address/%s">%v</a>`, addr, formatWithdrawalHash(hash)))
+		}
+
+		// Fall back to external explorer link
+		if Config.Frontend.EthExplorerLink != "" {
+			link, err := url.JoinPath(Config.Frontend.EthExplorerLink, "address", addr)
+			if err == nil {
+				return template.HTML(fmt.Sprintf(`<a href="%v">%v</a>`, link, formatWithdrawalHash(hash)))
+			}
 		}
 	}
 
@@ -518,4 +1105,55 @@ func formatAlertNumber(displayText string, value float64, yellowThreshold float6
 	default:
 		return template.HTML(displayText)
 	}
+}
+
+// IsSystemContract checks if an address is a known system contract
+func IsSystemContract(address []byte, systemContracts []*types.SystemContract) bool {
+	addressStr := common.BytesToAddress(address).Hex()
+	for _, sc := range systemContracts {
+		if sc.Address == addressStr {
+			return true
+		}
+	}
+	return false
+}
+
+// GetSystemContractName returns the name of a system contract if it exists
+func GetSystemContractName(address []byte, systemContracts []*types.SystemContract) string {
+	addressStr := common.BytesToAddress(address).Hex()
+	for _, sc := range systemContracts {
+		if sc.Address == addressStr {
+			return sc.Name
+		}
+	}
+	return ""
+}
+
+// CalculateBalanceDiff calculates the difference between two balance byte arrays and returns formatted result
+func CalculateBalanceDiff(current []byte, previous []byte) template.HTML {
+	currentBig := new(big.Int).SetBytes(current)
+	previousBig := new(big.Int).SetBytes(previous)
+
+	diff := new(big.Int).Sub(currentBig, previousBig)
+
+	if diff.Sign() == 0 {
+		return template.HTML("")
+	}
+
+	isPositive := diff.Sign() > 0
+	absDiff := new(big.Int).Abs(diff)
+	formattedDiff := FormatAmount(absDiff, "ETH", 18)
+
+	var class string
+	var sign string
+	if isPositive {
+		class = "positive"
+		sign = "+"
+	} else {
+		class = "negative"
+		sign = "-"
+	}
+
+	return template.HTML(fmt.Sprintf(`<span class="bal-balance-diff %s">(%s%s)</span>`,
+		class, sign, formattedDiff))
 }

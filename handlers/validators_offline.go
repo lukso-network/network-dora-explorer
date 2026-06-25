@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -8,14 +9,14 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/indexer/beacon"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
 	"github.com/ethpandaops/dora/utils"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -87,7 +88,7 @@ func getValidatorsOfflinePageData(pageIdx uint64, pageSize uint64, sortOrder str
 	pageCacheKey := fmt.Sprintf("validators_offline:%v:%v:%v:%v:%v", pageIdx, pageSize, sortOrder, groupBy, groupKey)
 	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(processingPage *services.FrontendCacheProcessingPage) interface{} {
 		processingPage.CacheTimeout = 10 * time.Second
-		return buildValidatorsOfflinePageData(pageIdx, pageSize, sortOrder, groupBy, groupKey)
+		return buildValidatorsOfflinePageData(processingPage.CallCtx, pageIdx, pageSize, sortOrder, groupBy, groupKey)
 	})
 	if pageErr == nil && pageRes != nil {
 		resData, resOk := pageRes.(*models.ValidatorsOfflinePageData)
@@ -99,7 +100,7 @@ func getValidatorsOfflinePageData(pageIdx uint64, pageSize uint64, sortOrder str
 	return pageData, pageErr
 }
 
-func buildValidatorsOfflinePageData(pageIdx uint64, pageSize uint64, sortOrder string, groupBy uint64, groupKey string) *models.ValidatorsOfflinePageData {
+func buildValidatorsOfflinePageData(ctx context.Context, pageIdx uint64, pageSize uint64, sortOrder string, groupBy uint64, groupKey string) *models.ValidatorsOfflinePageData {
 	chainState := services.GlobalBeaconService.GetChainState()
 
 	filterArgs := url.Values{}
@@ -236,7 +237,7 @@ func buildValidatorsOfflinePageData(pageIdx uint64, pageSize uint64, sortOrder s
 
 	// get validator set
 	var validatorSet []v1.Validator
-	validatorSetRsp, validatorSetLen := services.GlobalBeaconService.GetFilteredValidatorSet(&validatorFilter, true)
+	validatorSetRsp, validatorSetLen := services.GlobalBeaconService.GetFilteredValidatorSet(ctx, &validatorFilter, true)
 	if len(validatorSetRsp) == 0 {
 		validatorSet = []v1.Validator{}
 	} else {

@@ -2,16 +2,17 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethpandaops/dora/clients/consensus"
 	"github.com/ethpandaops/dora/db"
@@ -20,6 +21,7 @@ import (
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
 	"github.com/ethpandaops/dora/utils"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -63,6 +65,8 @@ func IndexData(w http.ResponseWriter, r *http.Request) {
 		handlePageError(w, r, pageError)
 		return
 	}
+	// stamp live server time outside of cached page data so clients can correct local clock drift
+	w.Header().Set("X-Server-Time", strconv.FormatInt(time.Now().UnixMilli(), 10))
 	w.Header().Set("Content-Type", "application/json")
 	err := json.NewEncoder(w).Encode(pageData)
 	if err != nil {
@@ -75,7 +79,7 @@ func getIndexPageData() (*models.IndexPageData, error) {
 	pageData := &models.IndexPageData{}
 	pageCacheKey := "index"
 	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
-		pageData, cacheTimeout := buildIndexPageData()
+		pageData, cacheTimeout := buildIndexPageData(pageCall.CallCtx)
 		pageCall.CacheTimeout = cacheTimeout
 		return pageData
 	})
@@ -89,7 +93,7 @@ func getIndexPageData() (*models.IndexPageData, error) {
 	return pageData, pageErr
 }
 
-func buildIndexPageData() (*models.IndexPageData, time.Duration) {
+func buildIndexPageData(ctx context.Context) (*models.IndexPageData, time.Duration) {
 	logrus.Debugf("index page called")
 
 	recentEpochCount := 7
@@ -107,7 +111,7 @@ func buildIndexPageData() (*models.IndexPageData, time.Duration) {
 	justifiedEpoch, _ := chainState.GetJustifiedCheckpoint()
 
 	syncState := dbtypes.IndexerSyncState{}
-	db.GetExplorerState("indexer.syncstate", &syncState)
+	db.GetExplorerState(ctx, "indexer.syncstate", &syncState)
 	var isSynced bool
 	if finalizedEpoch >= 1 {
 		isSynced = syncState.Epoch >= uint64(finalizedEpoch-1)
@@ -120,8 +124,8 @@ func buildIndexPageData() (*models.IndexPageData, time.Duration) {
 		DepositContract:       common.Address(specs.DepositContractAddress).String(),
 		ShowSyncingMessage:    !isSynced,
 		SlotsPerEpoch:         specs.SlotsPerEpoch,
-		SecondsPerSlot:        uint64(specs.SecondsPerSlot),
-		SecondsPerEpoch:       uint64(specs.SecondsPerSlot * specs.SlotsPerEpoch),
+		SlotDurationMs:        specs.SlotDurationMs,
+		EpochDurationMs:       specs.SlotDurationMs * specs.SlotsPerEpoch,
 		CurrentEpoch:          uint64(currentEpoch),
 		CurrentFinalizedEpoch: int64(finalizedEpoch),
 		CurrentJustifiedEpoch: int64(justifiedEpoch),
@@ -289,27 +293,94 @@ func buildIndexPageData() (*models.IndexPageData, time.Duration) {
 			ForkDigest: forkDigest[:],
 		})
 	}
+	if specs.GloasForkEpoch != nil && *specs.GloasForkEpoch < uint64(18446744073709551615) {
+		blobParams := chainState.GetBlobScheduleForEpoch(phase0.Epoch(*specs.GloasForkEpoch))
+		forkDigest := chainState.GetForkDigest(specs.GloasForkVersion, blobParams)
+		pageData.NetworkForks = append(pageData.NetworkForks, &models.IndexPageDataForks{
+			Name:       "Gloas",
+			Epoch:      *specs.GloasForkEpoch,
+			Version:    specs.GloasForkVersion[:],
+			Time:       uint64(chainState.EpochToTime(phase0.Epoch(*specs.GloasForkEpoch)).Unix()),
+			Active:     uint64(currentEpoch) >= *specs.GloasForkEpoch,
+			Type:       "consensus",
+			ForkDigest: forkDigest[:],
+		})
+	}
+
+	if specs.HezeForkEpoch != nil && *specs.HezeForkEpoch < uint64(18446744073709551615) {
+		blobParams := chainState.GetBlobScheduleForEpoch(phase0.Epoch(*specs.HezeForkEpoch))
+		forkDigest := chainState.GetForkDigest(specs.HezeForkVersion, blobParams)
+		pageData.NetworkForks = append(pageData.NetworkForks, &models.IndexPageDataForks{
+			Name:       "Heze",
+			Epoch:      *specs.HezeForkEpoch,
+			Version:    specs.HezeForkVersion[:],
+			Time:       uint64(chainState.EpochToTime(phase0.Epoch(*specs.HezeForkEpoch)).Unix()),
+			Active:     uint64(currentEpoch) >= *specs.HezeForkEpoch,
+			Type:       "consensus",
+			ForkDigest: forkDigest[:],
+		})
+	}
 
 	// Add BPO forks from BLOB_SCHEDULE
-	for i, blobSchedule := range specs.BlobSchedule {
-		// BPO forks use the fork version that's active at the time of BPO activation
-		forkVersion := chainState.GetForkVersionAtEpoch(phase0.Epoch(blobSchedule.Epoch))
-		blobParams := &consensus.BlobScheduleEntry{
-			Epoch:            blobSchedule.Epoch,
-			MaxBlobsPerBlock: blobSchedule.MaxBlobsPerBlock,
-		}
-		forkDigest := chainState.GetForkDigest(forkVersion, blobParams)
+	elBlobSchedule := services.GlobalBeaconService.GetExecutionChainState().GetFullBlobSchedule()
+	if len(elBlobSchedule) > 0 {
+		// get blob schedule from el config (we have the full blob schedule available)
+		bpoIdx := 0
+		for _, blobSchedule := range elBlobSchedule {
+			if !blobSchedule.IsBpo {
+				continue
+			}
 
-		pageData.NetworkForks = append(pageData.NetworkForks, &models.IndexPageDataForks{
-			Name:             fmt.Sprintf("BPO%d", i+1),
-			Epoch:            blobSchedule.Epoch,
-			Version:          nil, // BPO forks don't have fork versions
-			Time:             uint64(chainState.EpochToTime(phase0.Epoch(blobSchedule.Epoch)).Unix()),
-			Active:           uint64(currentEpoch) >= blobSchedule.Epoch,
-			Type:             "bpo",
-			MaxBlobsPerBlock: &blobSchedule.MaxBlobsPerBlock,
-			ForkDigest:       forkDigest[:],
-		})
+			bpoIdx++
+
+			bpoEpoch := phase0.Epoch(0)
+			bpoTime := blobSchedule.Timestamp
+			if blobSchedule.Timestamp.After(networkGenesis.GenesisTime) {
+				bpoEpoch = chainState.EpochOfSlot(chainState.TimeToSlot(blobSchedule.Timestamp))
+			} else {
+				bpoTime = networkGenesis.GenesisTime
+			}
+
+			forkVersion := chainState.GetForkVersionAtEpoch(bpoEpoch)
+			blobParams := &consensus.BlobScheduleEntry{
+				Epoch:            uint64(bpoEpoch),
+				MaxBlobsPerBlock: blobSchedule.Schedule.Max,
+			}
+			forkDigest := chainState.GetForkDigest(forkVersion, blobParams)
+
+			pageData.NetworkForks = append(pageData.NetworkForks, &models.IndexPageDataForks{
+				Name:             fmt.Sprintf("BPO%d", bpoIdx),
+				Epoch:            uint64(bpoEpoch),
+				Version:          nil,
+				Time:             uint64(bpoTime.Unix()),
+				Active:           currentEpoch >= bpoEpoch,
+				Type:             "bpo",
+				MaxBlobsPerBlock: &blobSchedule.Schedule.Max,
+				ForkDigest:       forkDigest[:],
+			})
+		}
+	} else {
+		// get blob schedule from cl specs (no el config available, so we only get the deduplicated blob schedule from the cl specs)
+		for i, blobSchedule := range specs.BlobSchedule {
+			// BPO forks use the fork version that's active at the time of BPO activation
+			forkVersion := chainState.GetForkVersionAtEpoch(phase0.Epoch(blobSchedule.Epoch))
+			blobParams := &consensus.BlobScheduleEntry{
+				Epoch:            blobSchedule.Epoch,
+				MaxBlobsPerBlock: blobSchedule.MaxBlobsPerBlock,
+			}
+			forkDigest := chainState.GetForkDigest(forkVersion, blobParams)
+
+			pageData.NetworkForks = append(pageData.NetworkForks, &models.IndexPageDataForks{
+				Name:             fmt.Sprintf("BPO%d", i+1),
+				Epoch:            blobSchedule.Epoch,
+				Version:          nil, // BPO forks don't have fork versions
+				Time:             uint64(chainState.EpochToTime(phase0.Epoch(blobSchedule.Epoch)).Unix()),
+				Active:           uint64(currentEpoch) >= blobSchedule.Epoch,
+				Type:             "bpo",
+				MaxBlobsPerBlock: &blobSchedule.MaxBlobsPerBlock,
+				ForkDigest:       forkDigest[:],
+			})
+		}
 	}
 
 	// Sort all forks by epoch
@@ -318,23 +389,24 @@ func buildIndexPageData() (*models.IndexPageData, time.Duration) {
 	})
 
 	// load recent epochs
-	buildIndexPageRecentEpochsData(pageData, currentEpoch, finalizedEpoch, justifiedEpoch, recentEpochCount)
+	buildIndexPageRecentEpochsData(ctx, pageData, currentEpoch, finalizedEpoch, justifiedEpoch, recentEpochCount)
 
 	// load recent blocks
-	buildIndexPageRecentBlocksData(pageData, recentBlockCount)
+	buildIndexPageRecentBlocksData(ctx, pageData, recentBlockCount)
 
 	// load recent slots
-	buildIndexPageRecentSlotsData(pageData, currentSlot, recentSlotsCount)
+	buildIndexPageRecentSlotsData(ctx, pageData, currentSlot, recentSlotsCount)
 
 	return pageData, 12 * time.Second
 }
 
-func buildIndexPageRecentEpochsData(pageData *models.IndexPageData, currentEpoch phase0.Epoch, finalizedEpoch phase0.Epoch, justifiedEpoch phase0.Epoch, recentEpochCount int) {
+func buildIndexPageRecentEpochsData(ctx context.Context, pageData *models.IndexPageData, currentEpoch phase0.Epoch, finalizedEpoch phase0.Epoch, justifiedEpoch phase0.Epoch, recentEpochCount int) {
 	pageData.RecentEpochs = make([]*models.IndexPageDataEpochs, 0)
 
 	chainState := services.GlobalBeaconService.GetChainState()
+	specs := chainState.GetSpecs()
 
-	epochsData := services.GlobalBeaconService.GetDbEpochs(uint64(currentEpoch), uint32(recentEpochCount))
+	epochsData := services.GlobalBeaconService.GetDbEpochs(ctx, uint64(currentEpoch), uint32(recentEpochCount))
 	for i := 0; i < len(epochsData); i++ {
 		epochData := epochsData[i]
 		if epochData == nil {
@@ -344,25 +416,32 @@ func buildIndexPageRecentEpochsData(pageData *models.IndexPageData, currentEpoch
 		if epochData.Eligible > 0 {
 			voteParticipation = float64(epochData.VotedTarget) * 100.0 / float64(epochData.Eligible)
 		}
+		proposalParticipation := float64(0)
+		if specs.SlotsPerEpoch > 0 {
+			proposalParticipation = float64(epochData.BlockCount) * 100.0 / float64(specs.SlotsPerEpoch)
+		}
 		pageData.RecentEpochs = append(pageData.RecentEpochs, &models.IndexPageDataEpochs{
-			Epoch:             epochData.Epoch,
-			Ts:                chainState.EpochToTime(phase0.Epoch(epochData.Epoch)),
-			Finalized:         uint64(finalizedEpoch) > 0 && uint64(finalizedEpoch) >= epochData.Epoch,
-			Justified:         uint64(justifiedEpoch) > 0 && uint64(justifiedEpoch) >= epochData.Epoch,
-			EligibleEther:     epochData.Eligible,
-			TargetVoted:       epochData.VotedTarget,
-			VoteParticipation: voteParticipation,
+			Epoch:                 epochData.Epoch,
+			Ts:                    chainState.EpochToTime(phase0.Epoch(epochData.Epoch)),
+			Finalized:             uint64(finalizedEpoch) > 0 && uint64(finalizedEpoch) >= epochData.Epoch,
+			Justified:             uint64(justifiedEpoch) > 0 && uint64(justifiedEpoch) >= epochData.Epoch,
+			EligibleEther:         epochData.Eligible,
+			TargetVoted:           epochData.VotedTarget,
+			VoteParticipation:     voteParticipation,
+			BlockCount:            uint64(epochData.BlockCount),
+			SlotsPerEpoch:         specs.SlotsPerEpoch,
+			ProposalParticipation: proposalParticipation,
 		})
 	}
 	pageData.RecentEpochCount = uint64(len(pageData.RecentEpochs))
 }
 
-func buildIndexPageRecentBlocksData(pageData *models.IndexPageData, recentBlockCount int) {
+func buildIndexPageRecentBlocksData(ctx context.Context, pageData *models.IndexPageData, recentBlockCount int) {
 	pageData.RecentBlocks = make([]*models.IndexPageDataBlocks, 0)
 
 	chainState := services.GlobalBeaconService.GetChainState()
 
-	blocksData := services.GlobalBeaconService.GetDbBlocksByFilter(&dbtypes.BlockFilter{
+	blocksData := services.GlobalBeaconService.GetDbBlocksByFilter(ctx, &dbtypes.BlockFilter{
 		WithOrphaned: 0,
 		WithMissing:  0,
 	}, 0, uint32(recentBlockCount), 0)
@@ -376,14 +455,23 @@ func buildIndexPageRecentBlocksData(pageData *models.IndexPageData, recentBlockC
 		if blockData == nil {
 			continue
 		}
+
+		epoch := chainState.EpochOfSlot(phase0.Slot(blockData.Slot))
+
+		payloadStatus := blockData.PayloadStatus
+		if !chainState.IsEip7732Enabled(epoch) {
+			payloadStatus = dbtypes.PayloadStatusCanonical
+		}
+
 		blockModel := &models.IndexPageDataBlocks{
-			Epoch:        uint64(chainState.EpochOfSlot(phase0.Slot(blockData.Slot))),
-			Slot:         blockData.Slot,
-			Ts:           chainState.SlotToTime(phase0.Slot(blockData.Slot)),
-			Proposer:     blockData.Proposer,
-			ProposerName: services.GlobalBeaconService.GetValidatorName(blockData.Proposer),
-			Status:       uint64(blockData.Status),
-			BlockRoot:    blockData.Root,
+			Epoch:         uint64(epoch),
+			Slot:          blockData.Slot,
+			Ts:            chainState.SlotToTime(phase0.Slot(blockData.Slot)),
+			Proposer:      blockData.Proposer,
+			ProposerName:  services.GlobalBeaconService.GetValidatorName(blockData.Proposer),
+			Status:        uint64(blockData.Status),
+			PayloadStatus: uint8(payloadStatus),
+			BlockRoot:     blockData.Root,
 		}
 		if blockData.EthBlockNumber != nil {
 			blockModel.WithEthBlock = true
@@ -397,7 +485,7 @@ func buildIndexPageRecentBlocksData(pageData *models.IndexPageData, recentBlockC
 	pageData.RecentBlockCount = uint64(len(pageData.RecentBlocks))
 }
 
-func buildIndexPageRecentSlotsData(pageData *models.IndexPageData, firstSlot phase0.Slot, slotLimit int) {
+func buildIndexPageRecentSlotsData(ctx context.Context, pageData *models.IndexPageData, firstSlot phase0.Slot, slotLimit int) {
 	var lastSlot uint64
 	if uint64(firstSlot) >= uint64(slotLimit) {
 		lastSlot = uint64(firstSlot) - uint64(slotLimit)
@@ -409,7 +497,7 @@ func buildIndexPageRecentSlotsData(pageData *models.IndexPageData, firstSlot pha
 
 	// load slots
 	pageData.RecentSlots = make([]*models.IndexPageDataSlots, 0)
-	dbSlots := services.GlobalBeaconService.GetDbBlocksForSlots(uint64(firstSlot), uint32(slotLimit), true, true)
+	dbSlots := services.GlobalBeaconService.GetDbBlocksForSlots(ctx, uint64(firstSlot), uint32(slotLimit), true, true)
 	dbIdx := 0
 	dbCnt := len(dbSlots)
 	blockCount := uint64(0)
@@ -421,16 +509,24 @@ func buildIndexPageRecentSlotsData(pageData *models.IndexPageData, firstSlot pha
 			dbSlot := dbSlots[dbIdx]
 			dbIdx++
 
+			epoch := chainState.EpochOfSlot(phase0.Slot(dbSlot.Slot))
+
+			payloadStatus := dbSlot.PayloadStatus
+			if !chainState.IsEip7732Enabled(phase0.Epoch(epoch)) {
+				payloadStatus = dbtypes.PayloadStatusCanonical
+			}
+
 			slotData := &models.IndexPageDataSlots{
-				Slot:         slot,
-				Epoch:        uint64(chainState.EpochOfSlot(phase0.Slot(dbSlot.Slot))),
-				Ts:           chainState.SlotToTime(phase0.Slot(slot)),
-				Status:       uint64(dbSlot.Status),
-				Proposer:     dbSlot.Proposer,
-				ProposerName: services.GlobalBeaconService.GetValidatorName(dbSlot.Proposer),
-				BlockRoot:    dbSlot.Root,
-				ParentRoot:   dbSlot.ParentRoot,
-				ForkGraph:    make([]*models.IndexPageDataForkGraph, 0),
+				Slot:          slot,
+				Epoch:         uint64(epoch),
+				Ts:            chainState.SlotToTime(phase0.Slot(slot)),
+				Status:        uint64(dbSlot.Status),
+				PayloadStatus: uint8(payloadStatus),
+				Proposer:      dbSlot.Proposer,
+				ProposerName:  services.GlobalBeaconService.GetValidatorName(dbSlot.Proposer),
+				BlockRoot:     dbSlot.Root,
+				ParentRoot:    dbSlot.ParentRoot,
+				ForkGraph:     make([]*models.IndexPageDataForkGraph, 0),
 			}
 			pageData.RecentSlots = append(pageData.RecentSlots, slotData)
 			blockCount++
@@ -442,7 +538,7 @@ func buildIndexPageRecentSlotsData(pageData *models.IndexPageData, firstSlot pha
 		}
 	}
 	pageData.RecentSlotCount = uint64(blockCount)
-	pageData.ForkTreeWidth = (maxOpenFork * 20) + 20
+	pageData.ForkTreeWidth = int32((maxOpenFork * 20) + 20)
 }
 
 func buildIndexPageSlotGraph(slotData *models.IndexPageDataSlots, maxOpenFork *int, openForks map[int][]byte) {
@@ -457,15 +553,22 @@ func buildIndexPageSlotGraph(slotData *models.IndexPageDataSlots, maxOpenFork *i
 		} else {
 			for graphCount <= forkIdx {
 				forkGraph = &models.IndexPageDataForkGraph{
-					Index: graphCount,
-					Left:  10 + (graphCount * 20),
-					Tiles: map[string]bool{},
+					Index: int32(graphCount),
+					Left:  int32(10 + (graphCount * 20)),
+					Tiles: make([]string, 0),
 				}
 				slotData.ForkGraph = append(slotData.ForkGraph, forkGraph)
 				graphCount++
 			}
 		}
 		return forkGraph
+	}
+
+	addTile := func(forkGraph *models.IndexPageDataForkGraph, tile string) {
+		if slices.Contains(forkGraph.Tiles, tile) {
+			return
+		}
+		forkGraph.Tiles = append(forkGraph.Tiles, tile)
 	}
 
 	for forkIdx := 0; forkIdx < *maxOpenFork; forkIdx++ {
@@ -476,7 +579,7 @@ func buildIndexPageSlotGraph(slotData *models.IndexPageDataSlots, maxOpenFork *i
 			}
 			continue
 		} else {
-			forkGraph.Tiles["vline"] = true
+			addTile(forkGraph, "vline")
 			if bytes.Equal(openForks[forkIdx], slotData.BlockRoot) {
 				if forkGraphIdx != -1 {
 					continue
@@ -491,14 +594,14 @@ func buildIndexPageSlotGraph(slotData *models.IndexPageDataSlots, maxOpenFork *i
 					for idx := forkIdx + 1; idx <= targetIdx; idx++ {
 						splitGraph := getForkGraph(slotData, idx)
 						if idx == targetIdx {
-							splitGraph.Tiles["tline"] = true
-							splitGraph.Tiles["lline"] = true
-							splitGraph.Tiles["fork"] = true
+							addTile(splitGraph, "tline")
+							addTile(splitGraph, "lline")
+							addTile(splitGraph, "fork")
 						} else {
-							splitGraph.Tiles["hline"] = true
+							addTile(splitGraph, "hline")
 						}
 					}
-					forkGraph.Tiles["rline"] = true
+					addTile(forkGraph, "rline")
 					openForks[targetIdx] = nil
 				}
 			}
@@ -513,6 +616,6 @@ func buildIndexPageSlotGraph(slotData *models.IndexPageDataSlots, maxOpenFork *i
 		openForks[freeForkIdx] = slotData.ParentRoot
 		forkGraph := getForkGraph(slotData, freeForkIdx)
 		forkGraph.Block = true
-		forkGraph.Tiles["bline"] = true
+		addTile(forkGraph, "bline")
 	}
 }

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"net/http"
@@ -9,11 +10,11 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
 	"github.com/sirupsen/logrus"
 )
 
@@ -86,8 +87,10 @@ func QueuedConsolidations(w http.ResponseWriter, r *http.Request) {
 func getFilteredQueuedConsolidationsPageData(pageIdx uint64, pageSize uint64, minSrcIndex uint64, maxSrcIndex uint64, minTgtIndex uint64, maxTgtIndex uint64, validatorName string, pubkey string) (*models.QueuedConsolidationsPageData, error) {
 	pageData := &models.QueuedConsolidationsPageData{}
 	pageCacheKey := fmt.Sprintf("queued_consolidations:%v:%v:%v:%v:%v:%v:%v:%v", pageIdx, pageSize, minSrcIndex, maxSrcIndex, minTgtIndex, maxTgtIndex, validatorName, pubkey)
-	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(_ *services.FrontendCacheProcessingPage) interface{} {
-		return buildFilteredQueuedConsolidationsPageData(pageIdx, pageSize, minSrcIndex, maxSrcIndex, minTgtIndex, maxTgtIndex, validatorName, pubkey)
+	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
+		pageData, cacheTimeout := buildFilteredQueuedConsolidationsPageData(pageCall.CallCtx, pageIdx, pageSize, minSrcIndex, maxSrcIndex, minTgtIndex, maxTgtIndex, validatorName, pubkey)
+		pageCall.CacheTimeout = cacheTimeout
+		return pageData
 	})
 	if pageErr == nil && pageRes != nil {
 		resData, resOk := pageRes.(*models.QueuedConsolidationsPageData)
@@ -99,7 +102,8 @@ func getFilteredQueuedConsolidationsPageData(pageIdx uint64, pageSize uint64, mi
 	return pageData, pageErr
 }
 
-func buildFilteredQueuedConsolidationsPageData(pageIdx uint64, pageSize uint64, minSrcIndex uint64, maxSrcIndex uint64, minTgtIndex uint64, maxTgtIndex uint64, validatorName string, pubkey string) *models.QueuedConsolidationsPageData {
+func buildFilteredQueuedConsolidationsPageData(ctx context.Context, pageIdx uint64, pageSize uint64, minSrcIndex uint64, maxSrcIndex uint64, minTgtIndex uint64, maxTgtIndex uint64, validatorName string, pubkey string) (*models.QueuedConsolidationsPageData, time.Duration) {
+	cacheTimeout := 5 * time.Minute
 	filterArgs := url.Values{}
 	if minSrcIndex != 0 {
 		filterArgs.Add("f.minsi", fmt.Sprintf("%v", minSrcIndex))
@@ -162,7 +166,7 @@ func buildFilteredQueuedConsolidationsPageData(pageIdx uint64, pageSize uint64, 
 		queueFilter.MaxTgtIndex = &maxTgtIndex
 	}
 
-	dbQueuedConsolidations, totalQueuedConsolidations := services.GlobalBeaconService.GetConsolidationQueueByFilter(queueFilter, (pageIdx-1)*pageSize, pageSize)
+	dbQueuedConsolidations, totalQueuedConsolidations := services.GlobalBeaconService.GetConsolidationQueueByFilter(ctx, queueFilter, (pageIdx-1)*pageSize, pageSize)
 	chainState := services.GlobalBeaconService.GetChainState()
 
 	for _, queueEntry := range dbQueuedConsolidations {
@@ -175,7 +179,9 @@ func buildFilteredQueuedConsolidationsPageData(pageIdx uint64, pageSize uint64, 
 			consolidationData.SourceEffectiveBalance = uint64(queueEntry.SrcValidator.Validator.EffectiveBalance)
 
 			validator := services.GlobalBeaconService.GetValidatorByIndex(queueEntry.SrcValidator.Index, false)
-			if strings.HasPrefix(validator.Status.String(), "pending") {
+			if validator == nil {
+				consolidationData.SourceValidatorStatus = "Unknown"
+			} else if strings.HasPrefix(validator.Status.String(), "pending") {
 				consolidationData.SourceValidatorStatus = "Pending"
 			} else if validator.Status == v1.ValidatorStateActiveOngoing {
 				consolidationData.SourceValidatorStatus = "Active"
@@ -241,18 +247,18 @@ func buildFilteredQueuedConsolidationsPageData(pageIdx uint64, pageSize uint64, 
 	}
 
 	// Populate UrlParams for page jump functionality
-	pageData.UrlParams = make(map[string]string)
+	pageData.UrlParams = make([]models.UrlParam, 0)
 	for key, values := range filterArgs {
 		if len(values) > 0 {
-			pageData.UrlParams[key] = values[0]
+			pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{Key: key, Value: values[0]})
 		}
 	}
-	pageData.UrlParams["c"] = fmt.Sprintf("%v", pageData.PageSize)
+	pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{Key: "c", Value: fmt.Sprintf("%v", pageData.PageSize)})
 
 	pageData.FirstPageLink = fmt.Sprintf("/validators/queued_consolidations?f&%v&c=%v", filterArgs.Encode(), pageData.PageSize)
 	pageData.PrevPageLink = fmt.Sprintf("/validators/queued_consolidations?f&%v&c=%v&p=%v", filterArgs.Encode(), pageData.PageSize, pageData.PrevPageIndex)
 	pageData.NextPageLink = fmt.Sprintf("/validators/queued_consolidations?f&%v&c=%v&p=%v", filterArgs.Encode(), pageData.PageSize, pageData.NextPageIndex)
 	pageData.LastPageLink = fmt.Sprintf("/validators/queued_consolidations?f&%v&c=%v&p=%v", filterArgs.Encode(), pageData.PageSize, pageData.LastPageIndex)
 
-	return pageData
+	return pageData, cacheTimeout
 }

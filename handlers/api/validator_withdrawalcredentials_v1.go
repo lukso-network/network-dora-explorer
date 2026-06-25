@@ -63,7 +63,7 @@ func ApiWithdrawalCredentialsValidatorsV1(w http.ResponseWriter, r *http.Request
 		Offset:            offset,
 	}
 
-	relevantValidators, _ := services.GlobalBeaconService.GetValidatorsByWithdrawalFilter(*filter, true)
+	relevantValidators, _ := services.GlobalBeaconService.GetFilteredValidatorSet(r.Context(), filter, true)
 
 	data := []*ApiWithdrawalCredentialsResponseV1{}
 	for _, validator := range relevantValidators {

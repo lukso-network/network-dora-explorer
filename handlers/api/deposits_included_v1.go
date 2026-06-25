@@ -7,10 +7,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -64,6 +64,7 @@ type APIDepositIncludedInfo struct {
 // @Param with_orphaned query int false "Include orphaned deposits (0=canonical only, 1=include all, 2=orphaned only)"
 // @Param address query string false "Filter by depositor address"
 // @Param with_valid query int false "Filter by signature validity (0=invalid only, 1=valid only, 2=all)"
+// @Param cred_type query []int false "Filter by withdrawal credential type prefix byte (0-3). Repeat the parameter to include multiple types, e.g. cred_type=1&cred_type=2." collectionFormat(multi)
 // @Success 200 {object} APIDepositsIncludedResponse
 // @Failure 400 {object} map[string]string "Invalid parameters"
 // @Failure 500 {object} map[string]string "Internal server error"
@@ -170,12 +171,25 @@ func APIDepositsIncludedV1(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Withdrawal credential type filter (repeatable: cred_type=0&cred_type=1)
+	if credVals, ok := query["cred_type"]; ok {
+		seen := map[uint8]bool{}
+		for _, v := range credVals {
+			t, err := strconv.ParseUint(v, 10, 8)
+			if err != nil || t > 3 || seen[uint8(t)] {
+				continue
+			}
+			seen[uint8(t)] = true
+			depositFilter.WithdrawalCredTypes = append(depositFilter.WithdrawalCredTypes, uint8(t))
+		}
+	}
+
 	// Get deposits included in blocks using the proper service method
 	combinedFilter := &services.CombinedDepositRequestFilter{
 		Filter: depositFilter,
 	}
 
-	dbDeposits, totalCount := services.GlobalBeaconService.GetDepositRequestsByFilter(combinedFilter, offset, limit)
+	dbDeposits, totalCount := services.GlobalBeaconService.GetDepositRequestsByFilter(r.Context(), combinedFilter, offset, limit)
 
 	var deposits []*APIDepositIncludedInfo
 	for _, deposit := range dbDeposits {

@@ -7,10 +7,10 @@ import (
 	"strconv"
 	"strings"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -148,7 +148,7 @@ func APIVoluntaryExitsV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get voluntary exits from service
-	dbVoluntaryExits, totalRows := services.GlobalBeaconService.GetVoluntaryExitsByFilter(voluntaryExitFilter, pageIdx-1, uint32(limit))
+	dbVoluntaryExits, totalRows := services.GlobalBeaconService.GetVoluntaryExitsByFilter(r.Context(), voluntaryExitFilter, pageIdx-1, uint32(limit))
 	chainState := services.GlobalBeaconService.GetChainState()
 
 	var voluntaryExits []*APIVoluntaryExitInfo

@@ -7,30 +7,33 @@ import (
 	"math"
 	"strings"
 
-	"github.com/attestantio/go-eth2-client/spec"
-	"github.com/attestantio/go-eth2-client/spec/deneb"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/ethpandaops/go-eth2-client/spec"
+	"github.com/ethpandaops/go-eth2-client/spec/all"
+	"github.com/ethpandaops/go-eth2-client/spec/deneb"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 
 	"github.com/ethpandaops/dora/blockdb"
+	btypes "github.com/ethpandaops/dora/blockdb/types"
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/indexer/beacon"
 	"github.com/sirupsen/logrus"
 )
 
+var zeroExecHash phase0.Hash32
+
 type CombinedBlockResponse struct {
-	Root     phase0.Root
-	Header   *phase0.SignedBeaconBlockHeader
-	Block    *spec.VersionedSignedBeaconBlock
-	Orphaned bool
+	Root            phase0.Root
+	Header          *phase0.SignedBeaconBlockHeader
+	Block           *all.SignedBeaconBlock
+	Payload         *all.SignedExecutionPayloadEnvelope
+	BlockAccessList []byte
+	Orphaned        bool
 }
 
-// GetBlockBlob retrieves the blob sidecar for a given block root and commitment.
-// It first tries to find a client that has the block root in its cache, and if not found,
-// it falls back to a random ready client. It then retrieves the blob sidecars for the block root
-// and checks if any of them match the given commitment. If a match is found, it returns the blob sidecar,
-// otherwise it returns nil.
-func (bs *ChainService) GetBlockBlob(ctx context.Context, blockroot phase0.Root, commitment deneb.KZGCommitment) (*deneb.BlobSidecar, error) {
+// GetBlockBlob retrieves the blob data for a given block root and blob index.
+// It uses GetBlobsByBlockroot which works for both pre-Fulu and Fulu+ blocks.
+func (bs *ChainService) GetBlockBlob(ctx context.Context, blockroot phase0.Root, blobIndex uint64) (*deneb.Blob, error) {
 	client := bs.beaconIndexer.GetReadyClientByBlockRoot(blockroot, true)
 	if client == nil {
 		client = bs.beaconIndexer.GetReadyClient(true)
@@ -40,18 +43,16 @@ func (bs *ChainService) GetBlockBlob(ctx context.Context, blockroot phase0.Root,
 		return nil, fmt.Errorf("no clients available")
 	}
 
-	blobs, err := client.GetClient().GetRPCClient().GetBlobSidecarsByBlockroot(ctx, blockroot[:])
+	blobs, err := client.GetClient().GetRPCClient().GetBlobsByBlockroot(ctx, blockroot[:])
 	if err != nil {
 		return nil, err
 	}
 
-	for _, blob := range blobs {
-		if bytes.Equal(blob.KZGCommitment[:], commitment[:]) {
-			return blob, nil
-		}
+	if int(blobIndex) >= len(blobs) {
+		return nil, nil
 	}
 
-	return nil, nil
+	return blobs[blobIndex], nil
 }
 
 // GetSlotDetailsByBlockroot retrieves the combined block details for a given block root.
@@ -85,15 +86,9 @@ func (bs *ChainService) GetSlotDetailsByBlockroot(ctx context.Context, blockroot
 			header, err = beacon.LoadBeaconHeader(ctx, client, blockroot)
 			if header != nil {
 				break
-			} else if err != nil {
-				log := logrus.WithError(err)
-				if client != nil {
-					log = log.WithField("client", client.GetClient().GetName())
-				}
-				log.Warnf("Error loading block header for root 0x%x", blockroot)
 			}
 		}
-		if err != nil || header == nil {
+		if err != nil && header == nil {
 			return err
 		}
 		return nil
@@ -102,12 +97,13 @@ func (bs *ChainService) GetSlotDetailsByBlockroot(ctx context.Context, blockroot
 	// try loading from cache
 	if blockInfo := bs.beaconIndexer.GetBlockByRoot(blockroot); blockInfo != nil {
 		blockHeader := blockInfo.GetHeader()
-		blockBody := blockInfo.GetBlock()
+		blockBody := blockInfo.GetBlock(ctx)
 		if blockHeader != nil && blockBody != nil {
 			result = &CombinedBlockResponse{
 				Root:     blockInfo.Root,
-				Header:   blockInfo.GetHeader(),
-				Block:    blockInfo.GetBlock(),
+				Header:   blockHeader,
+				Block:    blockBody,
+				Payload:  blockInfo.GetExecutionPayload(ctx),
 				Orphaned: !bs.beaconIndexer.IsCanonicalBlock(blockInfo, nil),
 			}
 		}
@@ -116,60 +112,99 @@ func (bs *ChainService) GetSlotDetailsByBlockroot(ctx context.Context, blockroot
 		if err != nil {
 			return nil, err
 		}
+
 		result = &CombinedBlockResponse{
 			Root:     blockInfo.Root,
 			Header:   blockInfo.GetHeader(),
-			Block:    blockInfo.GetBlock(),
+			Block:    blockInfo.GetBlock(ctx),
+			Payload:  blockInfo.GetExecutionPayload(ctx),
 			Orphaned: true,
 		}
 	}
 
 	// try loading from connected clients
+	// A header-load failure here is not fatal: no connected client has the block
+	// (e.g. after a checkpoint sync). We fall through to the block db below.
 	if result == nil {
-		err := loadBlockHeader()
-		if err != nil {
-			return nil, err
+		if err := loadBlockHeader(); err != nil {
+			logrus.WithError(err).Debugf("could not load block header for root 0x%x from clients", blockroot)
 		}
 
-		var block *spec.VersionedSignedBeaconBlock
-		bodyRetry := 0
-		for ; bodyRetry < 3; bodyRetry++ {
-			client := clients[bodyRetry%len(clients)]
-			block, err = beacon.LoadBeaconBlock(ctx, client, blockroot)
-			if block != nil {
-				break
-			} else if err != nil {
-				log := logrus.WithError(err)
-				if client != nil {
-					log = log.WithField("client", client.GetClient().GetName())
+		if header != nil {
+			var err error
+			var block *all.SignedBeaconBlock
+			var payload *all.SignedExecutionPayloadEnvelope
+			bodyRetry := 0
+			for ; bodyRetry < 3; bodyRetry++ {
+				client := clients[bodyRetry%len(clients)]
+				if block == nil {
+					block, err = beacon.LoadBeaconBlock(ctx, client, blockroot)
+					if err != nil {
+						logrus.WithError(err).Debugf("could not load block body for root 0x%x from client %s", blockroot, client.GetClient().GetName())
+					}
 				}
-				log.Warnf("Error loading block body for root 0x%x", blockroot)
+
+				if block != nil && block.Version >= spec.DataVersionGloas {
+					payload, err = beacon.LoadExecutionPayload(ctx, client, blockroot)
+					if payload != nil {
+						break
+					} else if err != nil {
+						logrus.WithError(err).Debugf("could not load block payload for root 0x%x from client %s", blockroot, client.GetClient().GetName())
+					}
+				} else if block != nil {
+					break
+				}
 			}
-		}
-		if err == nil && block != nil {
-			result = &CombinedBlockResponse{
-				Root:     blockroot,
-				Header:   header,
-				Block:    block,
-				Orphaned: false,
+			if err == nil && block != nil {
+				result = &CombinedBlockResponse{
+					Root:     blockroot,
+					Header:   header,
+					Block:    block,
+					Payload:  payload,
+					Orphaned: false,
+				}
 			}
 		}
 	}
 
-	// try loading from block db
-	if result == nil && header != nil && blockdb.GlobalBlockDb != nil {
-		blockData, err := blockdb.GlobalBlockDb.GetBlock(ctx, uint64(header.Message.Slot), blockroot[:], func(version uint64, block []byte) (interface{}, error) {
-			return beacon.UnmarshalVersionedSignedBeaconBlockSSZ(bs.beaconIndexer.GetDynSSZ(), version, block)
-		})
-		if err == nil && blockData != nil {
-			result = &CombinedBlockResponse{
-				Root:     blockroot,
-				Header:   header,
-				Block:    blockData.Body.(*spec.VersionedSignedBeaconBlock),
-				Orphaned: false,
+	// fill any missing components (the whole block, or just the payload/BAL) from the
+	// long-term block db in a single request. This works even when no connected client
+	// still has the block (e.g. after all nodes checkpoint-synced past it). The slot
+	// needed to build the block db key is taken from the header when available,
+	// otherwise from our own db.
+	if blockdb.GlobalBlockDb != nil {
+		blockSlot := phase0.Slot(0)
+		haveSlot := false
+		switch {
+		case header != nil:
+			blockSlot, haveSlot = header.Message.Slot, true
+		case result != nil && result.Header != nil:
+			blockSlot, haveSlot = result.Header.Message.Slot, true
+		default:
+			if dbBlock := db.GetBlockHeadByRoot(ctx, blockroot[:]); dbBlock != nil {
+				blockSlot, haveSlot = phase0.Slot(dbBlock.Slot), true
+			}
+		}
+
+		if haveSlot {
+			completed, err := bs.completeBlockFromBlockDb(ctx, blockSlot, blockroot, header, result)
+			if err != nil {
+				if result == nil {
+					return nil, err
+				}
+				// We already have a usable block from cache/clients. A block db error
+				// while fetching a supplementary (and possibly genuinely missing)
+				// payload/BAL must not discard it - otherwise e.g. a Gloas block with a
+				// withheld payload would surface as "not found" rather than rendering
+				// with its payload marked missing/unavailable.
+				logrus.WithError(err).Debugf("could not complete block for root 0x%x from blockdb", blockroot)
+			} else {
+				result = completed
 			}
 		}
 	}
+
+	bs.populateBlockAccessList(ctx, result)
 
 	return result, nil
 }
@@ -199,17 +234,11 @@ func (bs *ChainService) GetSlotDetailsBySlot(ctx context.Context, slot phase0.Sl
 		for ; headRetry < 3; headRetry++ {
 			client := clients[headRetry%len(clients)]
 			header, blockRoot, orphaned, err = beacon.LoadBeaconHeaderBySlot(ctx, client, slot)
-			if err != nil {
-				log := logrus.WithError(err)
-				if client != nil {
-					log = log.WithField("client", client.GetClient().GetName())
-				}
-				log.Warnf("Error loading block header for slot %v", slot)
-			} else {
+			if header != nil {
 				break
 			}
 		}
-		if err != nil || header == nil {
+		if err != nil && header == nil {
 			return err
 		}
 		return nil
@@ -231,74 +260,227 @@ func (bs *ChainService) GetSlotDetailsBySlot(ctx context.Context, slot phase0.Sl
 		}
 
 		blockHeader := cachedBlock.GetHeader()
-		blockBody := cachedBlock.GetBlock()
+		blockBody := cachedBlock.GetBlock(ctx)
 		if blockHeader != nil && blockBody != nil {
 			result = &CombinedBlockResponse{
 				Root:     cachedBlock.Root,
 				Header:   blockHeader,
 				Block:    blockBody,
+				Payload:  cachedBlock.GetExecutionPayload(ctx),
 				Orphaned: isOrphaned,
 			}
 		}
 	}
 
 	// try loading from connected clients
+	// A header-load failure here is not fatal: no connected client has the block
+	// (e.g. after a checkpoint sync). We fall through to the block db below.
 	if result == nil {
 		if header == nil {
-			err := loadBlockHeader()
-			if err != nil {
-				return nil, err
+			if err := loadBlockHeader(); err != nil {
+				logrus.WithError(err).Debugf("could not load block header for slot %v from clients", slot)
 			}
 		}
 
-		var err error
-		var block *spec.VersionedSignedBeaconBlock
-		bodyRetry := 0
-		for ; bodyRetry < 3; bodyRetry++ {
-			client := clients[bodyRetry%len(clients)]
-			block, err = beacon.LoadBeaconBlock(ctx, client, blockRoot)
-			if block != nil {
-				break
-			} else if err != nil {
-				log := logrus.WithError(err)
-				if client != nil {
-					log = log.WithField("client", client.GetClient().GetName())
+		if header != nil {
+			var err error
+			var block *all.SignedBeaconBlock
+			var payload *all.SignedExecutionPayloadEnvelope
+			bodyRetry := 0
+			for ; bodyRetry < 3; bodyRetry++ {
+				client := clients[bodyRetry%len(clients)]
+				block, err = beacon.LoadBeaconBlock(ctx, client, blockRoot)
+				if err != nil {
+					logrus.WithError(err).Debugf("could not load block body for slot %v from client %s", slot, client.GetClient().GetName())
 				}
-				log.Warnf("Error loading block body for slot %v", slot)
+
+				if block != nil && block.Version >= spec.DataVersionGloas {
+					payload, err = beacon.LoadExecutionPayload(ctx, client, blockRoot)
+					if payload != nil {
+						break
+					} else if err != nil {
+						logrus.WithError(err).Debugf("could not load block payload for slot %v from client %s", slot, client.GetClient().GetName())
+					}
+				} else if block != nil {
+					break
+				}
 			}
-		}
-		if err == nil && block != nil {
-			result = &CombinedBlockResponse{
-				Root:     blockRoot,
-				Header:   header,
-				Block:    block,
-				Orphaned: orphaned,
+			if err == nil && block != nil {
+				result = &CombinedBlockResponse{
+					Root:     blockRoot,
+					Header:   header,
+					Block:    block,
+					Payload:  payload,
+					Orphaned: orphaned,
+				}
 			}
 		}
 	}
 
-	// try loading from block db
-	if result == nil && header != nil && blockdb.GlobalBlockDb != nil {
-		blockData, err := blockdb.GlobalBlockDb.GetBlock(ctx, uint64(slot), blockRoot[:], func(version uint64, block []byte) (interface{}, error) {
-			return beacon.UnmarshalVersionedSignedBeaconBlockSSZ(bs.beaconIndexer.GetDynSSZ(), version, block)
-		})
-		if err == nil && blockData != nil {
-			header := &phase0.SignedBeaconBlockHeader{}
-			err = header.UnmarshalSSZ(blockData.HeaderData)
-			if err != nil {
-				return nil, err
+	// fill any missing components (the whole block, or just the payload/BAL) from the
+	// long-term block db in a single request. This works even when no connected client
+	// still has the block (e.g. after all nodes checkpoint-synced past it). When no
+	// client could serve the header the canonical block root is resolved from our own db.
+	// Only attempt this when something is actually missing to avoid extra lookups for
+	// blocks that already loaded fully from cache or clients.
+	needsBlockDb := result == nil ||
+		(result.Block != nil && result.Block.Version >= spec.DataVersionGloas && result.Payload == nil)
+	if blockdb.GlobalBlockDb != nil && needsBlockDb {
+		if (blockRoot == phase0.Root{}) {
+			slotNum := uint64(slot)
+			for _, dbBlock := range bs.GetDbBlocksByFilter(ctx, &dbtypes.BlockFilter{Slot: &slotNum, WithOrphaned: 1}, 0, 10, 0) {
+				if dbBlock.Block != nil && dbBlock.Block.Status == dbtypes.Canonical && len(dbBlock.Block.Root) == 32 {
+					blockRoot = phase0.Root(dbBlock.Block.Root)
+					break
+				}
 			}
+		}
 
-			result = &CombinedBlockResponse{
-				Root:     blockRoot,
-				Header:   header,
-				Block:    blockData.Body.(*spec.VersionedSignedBeaconBlock),
-				Orphaned: false,
+		if (blockRoot != phase0.Root{}) {
+			wasNil := result == nil
+			completed, err := bs.completeBlockFromBlockDb(ctx, slot, blockRoot, header, result)
+			if err != nil {
+				if wasNil {
+					return nil, err
+				}
+				// We already have a usable block from cache/clients. A block db error
+				// while fetching a supplementary (and possibly genuinely missing)
+				// payload/BAL must not discard it - otherwise e.g. a Gloas block with a
+				// withheld payload would surface as "not found" rather than rendering
+				// with its payload marked missing/unavailable.
+				logrus.WithError(err).Debugf("could not complete block for slot %v from blockdb", slot)
+			} else {
+				if wasNil && completed != nil {
+					completed.Orphaned = orphaned
+				}
+				result = completed
 			}
+		}
+	}
+
+	bs.populateBlockAccessList(ctx, result)
+
+	return result, nil
+}
+
+// completeBlockFromBlockDb fills any block components still missing in result from
+// the long-term block db (e.g. S3) using a single GetBlock request. When result is
+// nil it builds the whole response (header, body, payload and BAL) - this works even
+// when no connected client still has the block, e.g. after all nodes checkpoint-synced
+// past it. When result already holds a Gloas+ block whose execution payload could not
+// be loaded from any client, it fetches the payload (and BAL) in the same request.
+// slot and blockroot identify the block; header is used as the response header when
+// available, otherwise it is reconstructed from the header stored alongside the block.
+// Returns the (possibly newly created) result; result is left unchanged when the block
+// db is not configured or has nothing to add.
+func (bs *ChainService) completeBlockFromBlockDb(ctx context.Context, slot phase0.Slot, blockroot phase0.Root, header *phase0.SignedBeaconBlockHeader, result *CombinedBlockResponse) (*CombinedBlockResponse, error) {
+	if blockdb.GlobalBlockDb == nil {
+		return result, nil
+	}
+
+	// Determine which components are still missing and request them all at once.
+	var flags btypes.BlockDataFlags
+	if result == nil {
+		flags = btypes.BlockDataFlagHeader | btypes.BlockDataFlagBody | btypes.BlockDataFlagPayload | btypes.BlockDataFlagBal
+	} else if result.Block != nil && result.Block.Version >= spec.DataVersionGloas && result.Payload == nil {
+		// We have the block but its payload (and possibly the BAL stored with it)
+		// couldn't be loaded from a client.
+		flags = btypes.BlockDataFlagPayload | btypes.BlockDataFlagBal
+	}
+	if flags == 0 {
+		return result, nil
+	}
+
+	blockData, err := blockdb.GlobalBlockDb.GetBlock(ctx, uint64(slot), blockroot[:], flags,
+		func(version uint64, block []byte) (any, error) {
+			return beacon.UnmarshalSignedBeaconBlockSSZ(bs.beaconIndexer.GetDynSSZ(), version, block)
+		}, func(version uint64, payload []byte) (any, error) {
+			return beacon.UnmarshalVersionedSignedExecutionPayloadEnvelopeSSZ(bs.beaconIndexer.GetDynSSZ(), version, payload)
+		})
+	if err != nil || blockData == nil {
+		return result, err
+	}
+
+	// Build the response when no client had the block.
+	if result == nil {
+		if blockData.Body == nil {
+			return nil, nil
+		}
+
+		block, ok := blockData.Body.(*all.SignedBeaconBlock)
+		if !ok {
+			return nil, fmt.Errorf("unexpected block type %T loaded from blockdb", blockData.Body)
+		}
+
+		if header == nil && len(blockData.HeaderData) > 0 {
+			header = &phase0.SignedBeaconBlockHeader{}
+			if err := header.UnmarshalSSZ(blockData.HeaderData); err != nil {
+				return nil, fmt.Errorf("failed to decode block header from blockdb: %w", err)
+			}
+		}
+
+		result = &CombinedBlockResponse{
+			Root:     blockroot,
+			Header:   header,
+			Block:    block,
+			Orphaned: false,
+		}
+	}
+
+	// Fill in the payload if we received one and don't have it yet.
+	if result.Payload == nil && blockData.Payload != nil {
+		payload, ok := blockData.Payload.(*all.SignedExecutionPayloadEnvelope)
+		if !ok {
+			return result, fmt.Errorf("unexpected payload type %T loaded from blockdb", blockData.Payload)
+		}
+		result.Payload = payload
+	}
+
+	// Fill in the BAL if we received one and don't have it yet.
+	if len(result.BlockAccessList) == 0 && blockData.BalVersion != 0 && len(blockData.BalData) > 0 {
+		if bal, err := beacon.UnmarshalBlockAccessList(blockData.BalVersion, blockData.BalData); err == nil {
+			result.BlockAccessList = bal
 		}
 	}
 
 	return result, nil
+}
+
+// populateBlockAccessList fills result.BlockAccessList for Gloas+ blocks.
+// Prefers the envelope's in-payload BAL, falling back to the BAL preserved
+// in blockdb when the node has pruned it (BAL is ephemeral on nodes but
+// stored forever in blockdb — see indexer/beacon/block.go writeToBlockDb).
+func (bs *ChainService) populateBlockAccessList(ctx context.Context, result *CombinedBlockResponse) {
+	if result == nil || result.Block == nil || result.Block.Version < spec.DataVersionGloas {
+		return
+	}
+	if len(result.BlockAccessList) > 0 {
+		return
+	}
+
+	if result.Payload != nil && result.Payload.Message != nil && result.Payload.Message.Payload != nil {
+		if bal := []byte(result.Payload.Message.Payload.BlockAccessList); len(bal) > 0 {
+			result.BlockAccessList = bal
+			return
+		}
+	}
+
+	if blockdb.GlobalBlockDb == nil || result.Header == nil {
+		return
+	}
+
+	blockData, err := blockdb.GlobalBlockDb.GetBlock(ctx, uint64(result.Header.Message.Slot), result.Root[:],
+		btypes.BlockDataFlagBal, nil, nil)
+	if err != nil || blockData == nil || blockData.BalVersion == 0 || len(blockData.BalData) == 0 {
+		return
+	}
+
+	bal, err := beacon.UnmarshalBlockAccessList(blockData.BalVersion, blockData.BalData)
+	if err != nil {
+		logrus.WithError(err).Debugf("failed to decode BAL from blockdb for block 0x%x", result.Root[:])
+		return
+	}
+	result.BlockAccessList = bal
 }
 
 // GetBlobSidecarsByBlockRoot retrieves the blob sidecars for a given block root.
@@ -314,13 +496,59 @@ func (bs *ChainService) GetBlobSidecarsByBlockRoot(ctx context.Context, blockroo
 	return client.GetClient().GetRPCClient().GetBlobSidecarsByBlockroot(ctx, blockroot)
 }
 
+// getPayloadStatus returns the payload status for a Gloas+ block, comparing
+// the committed BlockHash (from the bid) against the next canonical child's
+// bid.parent_block_hash. canonicalHead is the head as seen by the caller,
+// isCanonical indicates whether the block itself is canonical relative to it.
+func (bs *ChainService) getPayloadStatus(ctx context.Context, block *beacon.Block, canonicalHead *beacon.Block, isCanonical bool) dbtypes.PayloadStatus {
+	chainState := bs.consensusPool.GetChainState()
+	if !chainState.IsEip7732Enabled(chainState.EpochOfSlot(block.Slot)) {
+		return dbtypes.PayloadStatusCanonical
+	}
+
+	blockIndex := block.GetBlockIndex(ctx)
+	if blockIndex == nil || bytes.Equal(blockIndex.ExecutionHash[:], zeroExecHash[:]) {
+		return dbtypes.PayloadStatusMissing
+	}
+
+	childBlocks := bs.beaconIndexer.GetBlockByParentRoot(block.Root)
+	hasCanonicalChild := false
+	for _, child := range childBlocks {
+		childIndex := child.GetBlockIndex(ctx)
+		if childIndex == nil {
+			continue
+		}
+		if !bs.beaconIndexer.IsCanonicalBlockByHead(child, canonicalHead) {
+			continue
+		}
+		hasCanonicalChild = true
+		if bytes.Equal(childIndex.ExecutionParentHash[:], blockIndex.ExecutionHash[:]) {
+			return dbtypes.PayloadStatusCanonical
+		}
+	}
+
+	if !hasCanonicalChild && isCanonical {
+		// chain tip: no canonical successor exists yet that could reference the
+		// payload - treat a present payload as canonical (pending)
+		if block.HasExecutionPayload() {
+			return dbtypes.PayloadStatusCanonical
+		}
+		return dbtypes.PayloadStatusMissing
+	}
+
+	if block.HasExecutionPayload() {
+		return dbtypes.PayloadStatusOrphaned
+	}
+	return dbtypes.PayloadStatusMissing
+}
+
 // GetDbBlocksForSlots retrieves blocks for a range of slots from cache & database.
 // The firstSlot parameter specifies the starting slot.
 // The slotLimit parameter limits the number of slots to retrieve.
 // The withMissing parameter indicates whether to include missing blocks.
 // The withOrphaned parameter indicates whether to include orphaned blocks.
 // The returned slice contains the retrieved blocks.
-func (bs *ChainService) GetDbBlocksForSlots(firstSlot uint64, slotLimit uint32, withMissing bool, withOrphaned bool) []*dbtypes.Slot {
+func (bs *ChainService) GetDbBlocksForSlots(ctx context.Context, firstSlot uint64, slotLimit uint32, withMissing bool, withOrphaned bool) []*dbtypes.Slot {
 	resBlocks := make([]*dbtypes.Slot, 0)
 
 	chainState := bs.consensusPool.GetChainState()
@@ -339,7 +567,10 @@ func (bs *ChainService) GetDbBlocksForSlots(firstSlot uint64, slotLimit uint32, 
 	proposerAssignmentsEpoch := phase0.Epoch(math.MaxInt64)
 	getCanonicalProposer := func(slot phase0.Slot) phase0.ValidatorIndex {
 		epoch := chainState.EpochOfSlot(slot)
-		if epoch != proposerAssignmentsEpoch {
+		if proposerAssignmentsEpoch != phase0.Epoch(math.MaxInt64) && epoch == proposerAssignmentsEpoch+1 && chainState.IsFuluEnabled(epoch) {
+			// extended proposer lookahead in fulu, use the same proposer assignments as the previous epoch
+		} else if epoch != proposerAssignmentsEpoch {
+			assignmentsEpoch := epoch
 			if epochStats := bs.beaconIndexer.GetEpochStats(epoch, nil); epochStats != nil {
 				if epochStatsValues := epochStats.GetValues(true); epochStatsValues != nil {
 					proposerAssignments = map[phase0.Slot]phase0.ValidatorIndex{}
@@ -348,8 +579,20 @@ func (bs *ChainService) GetDbBlocksForSlots(firstSlot uint64, slotLimit uint32, 
 						proposerAssignments[slot] = proposer
 					}
 				}
+			} else if epoch > 0 && chainState.IsFuluEnabled(epoch-1) {
+				if epochStats := bs.beaconIndexer.GetEpochStats(epoch-1, nil); epochStats != nil {
+					if epochStatsValues := epochStats.GetValues(true); epochStatsValues != nil {
+						assignmentsEpoch = epoch - 1
+						proposerAssignments = map[phase0.Slot]phase0.ValidatorIndex{}
+						for slotIdx, proposer := range epochStatsValues.ProposerDuties {
+							slot := chainState.EpochToSlot(assignmentsEpoch) + phase0.Slot(slotIdx)
+							proposerAssignments[slot] = proposer
+						}
+					}
+				}
+
 			}
-			proposerAssignmentsEpoch = epoch
+			proposerAssignmentsEpoch = assignmentsEpoch
 		}
 
 		proposer, ok := proposerAssignments[slot]
@@ -369,6 +612,7 @@ func (bs *ChainService) GetDbBlocksForSlots(firstSlot uint64, slotLimit uint32, 
 			blocks := bs.beaconIndexer.GetBlocksBySlot(slot)
 			for _, block := range blocks {
 				isCanonical := bs.beaconIndexer.IsCanonicalBlockByHead(block, lastCanonicalBlock)
+				payloadStatus := bs.getPayloadStatus(ctx, block, lastCanonicalBlock, isCanonical)
 				if isCanonical {
 					lastCanonicalBlock = block
 				}
@@ -377,6 +621,7 @@ func (bs *ChainService) GetDbBlocksForSlots(firstSlot uint64, slotLimit uint32, 
 				}
 				dbBlock := block.GetDbBlock(bs.beaconIndexer, isCanonical)
 				if dbBlock != nil {
+					dbBlock.PayloadStatus = payloadStatus
 					resBlocks = append(resBlocks, dbBlock)
 				}
 			}
@@ -439,6 +684,7 @@ func (bs *ChainService) GetDbBlocksForSlots(firstSlot uint64, slotLimit uint32, 
 				}
 
 				isCanonical := bs.beaconIndexer.IsCanonicalBlockByHead(block, lastCanonicalBlock)
+				payloadStatus := bs.getPayloadStatus(ctx, block, lastCanonicalBlock, isCanonical)
 				if isCanonical {
 					lastCanonicalBlock = block
 				}
@@ -455,9 +701,10 @@ func (bs *ChainService) GetDbBlocksForSlots(firstSlot uint64, slotLimit uint32, 
 				blockRoots = append(blockRoots, block.Root[:])
 				blockRootsIdx = append(blockRootsIdx, len(resBlocks))
 				resBlocks = append(resBlocks, &dbtypes.Slot{
-					Slot:     uint64(slot),
-					Proposer: uint64(blockHeader.Message.ProposerIndex),
-					Status:   blockStatus,
+					Slot:          uint64(slot),
+					Proposer:      uint64(blockHeader.Message.ProposerIndex),
+					Status:        blockStatus,
+					PayloadStatus: payloadStatus,
 				})
 			}
 
@@ -495,11 +742,12 @@ func (bs *ChainService) GetDbBlocksForSlots(firstSlot uint64, slotLimit uint32, 
 
 		// load selected blocks from db
 		if len(blockRoots) > 0 {
-			blockMap := db.GetSlotsByRoots(blockRoots)
+			blockMap := db.GetSlotsByRoots(ctx, blockRoots)
 			if blockMap != nil {
 				for idx, blockRoot := range blockRoots {
 					if dbBlock, ok := blockMap[phase0.Root(blockRoot)]; ok {
 						dbBlock.Status = resBlocks[blockRootsIdx[idx]].Status
+						dbBlock.PayloadStatus = resBlocks[blockRootsIdx[idx]].PayloadStatus
 						resBlocks[blockRootsIdx[idx]] = dbBlock
 					}
 				}
@@ -513,7 +761,7 @@ func (bs *ChainService) GetDbBlocksForSlots(firstSlot uint64, slotLimit uint32, 
 
 	// get finalized blocks from db
 	if uint64(slot) > lastSlot {
-		dbBlocks := db.GetSlotsRange(uint64(slot), uint64(lastSlot), withMissing, withOrphaned)
+		dbBlocks := db.GetSlotsRange(ctx, uint64(slot), uint64(lastSlot), withMissing, withOrphaned)
 		for _, dbBlock := range dbBlocks {
 			if withMissing {
 				for ; uint64(slot) > dbBlock.Slot+1; slot-- {
@@ -554,10 +802,11 @@ func (bs *ChainService) GetDbBlocksForSlots(firstSlot uint64, slotLimit uint32, 
 }
 
 type cachedDbBlock struct {
-	slot     uint64
-	proposer uint64
-	orphaned bool
-	block    *beacon.Block
+	slot          uint64
+	proposer      uint64
+	orphaned      bool
+	payloadStatus dbtypes.PayloadStatus
+	block         *beacon.Block
 }
 
 // GetDbBlocksByFilter retrieves a filtered range of blocks from cache & database.
@@ -566,7 +815,7 @@ type cachedDbBlock struct {
 // The pageSize parameter specifies the page size.
 // The withScheduledCount parameter specifies the number of scheduled slots to include.
 // The returned slice contains the retrieved blocks.
-func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx uint64, pageSize uint32, withScheduledCount uint64) []*dbtypes.AssignedSlot {
+func (bs *ChainService) GetDbBlocksByFilter(ctx context.Context, filter *dbtypes.BlockFilter, pageIdx uint64, pageSize uint32, withScheduledCount uint64) []*dbtypes.AssignedSlot {
 	cachedMatches := make([]cachedDbBlock, 0)
 
 	chainState := bs.consensusPool.GetChainState()
@@ -585,7 +834,10 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 	proposerAssignmentsEpoch := phase0.Epoch(math.MaxInt64)
 	getCanonicalProposer := func(slot phase0.Slot) phase0.ValidatorIndex {
 		epoch := chainState.EpochOfSlot(slot)
-		if epoch != proposerAssignmentsEpoch {
+		if proposerAssignmentsEpoch != phase0.Epoch(math.MaxInt64) && epoch == proposerAssignmentsEpoch+1 && chainState.IsFuluEnabled(epoch) {
+			// extended proposer lookahead in fulu, use the same proposer assignments as the previous epoch
+		} else if epoch != proposerAssignmentsEpoch {
+			assignmentsEpoch := epoch
 			if epochStats := bs.beaconIndexer.GetEpochStats(epoch, nil); epochStats != nil {
 				if epochStatsValues := epochStats.GetValues(true); epochStatsValues != nil {
 					proposerAssignments = map[phase0.Slot]phase0.ValidatorIndex{}
@@ -594,8 +846,20 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 						proposerAssignments[slot] = proposer
 					}
 				}
+			} else if epoch > 0 && chainState.IsFuluEnabled(epoch-1) {
+				if epochStats := bs.beaconIndexer.GetEpochStats(epoch-1, nil); epochStats != nil {
+					if epochStatsValues := epochStats.GetValues(true); epochStatsValues != nil {
+						assignmentsEpoch = epoch - 1
+						proposerAssignments = map[phase0.Slot]phase0.ValidatorIndex{}
+						for slotIdx, proposer := range epochStatsValues.ProposerDuties {
+							slot := chainState.EpochToSlot(assignmentsEpoch) + phase0.Slot(slotIdx)
+							proposerAssignments[slot] = proposer
+						}
+					}
+				}
+
 			}
-			proposerAssignmentsEpoch = epoch
+			proposerAssignmentsEpoch = assignmentsEpoch
 		}
 
 		proposer, ok := proposerAssignments[slot]
@@ -606,11 +870,42 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 		return proposer
 	}
 
+	// Convert epoch filters to slot filters for use in DB query
+	if filter.MinEpoch != nil && filter.MinSlot == nil {
+		minSlot := uint64(chainState.EpochToSlot(phase0.Epoch(*filter.MinEpoch)))
+		filter.MinSlot = &minSlot
+	}
+	if filter.MaxEpoch != nil && filter.MaxSlot == nil {
+		maxSlot := uint64(chainState.EpochToSlot(phase0.Epoch(*filter.MaxEpoch+1))) - 1
+		filter.MaxSlot = &maxSlot
+	}
+
+	if filter.WithPayloadMask == 0 {
+		filter.WithPayloadMask = dbtypes.PayloadStatusMaskAll
+	}
+
 	// get blocks from cache
 	// iterate from current slot to finalized slot
-	lastCanonicalBlock := bs.beaconIndexer.GetCanonicalHead(nil)
+	canonicalHead := bs.beaconIndexer.GetCanonicalHead(nil)
+	lastCanonicalBlock := canonicalHead
 
-	for slotIdx := int64(startSlot); slotIdx >= int64(finalizedSlot); slotIdx-- {
+	// apply epoch filter to slot range
+	cacheStartSlot := startSlot
+	cacheFinalizedSlot := finalizedSlot
+	if filter.MaxSlot != nil {
+		maxSlotVal := phase0.Slot(*filter.MaxSlot)
+		if maxSlotVal < cacheStartSlot {
+			cacheStartSlot = maxSlotVal
+		}
+	}
+	if filter.MinSlot != nil {
+		minSlotVal := phase0.Slot(*filter.MinSlot)
+		if minSlotVal > cacheFinalizedSlot {
+			cacheFinalizedSlot = minSlotVal
+		}
+	}
+
+	for slotIdx := int64(cacheStartSlot); slotIdx >= int64(cacheFinalizedSlot); slotIdx-- {
 		slot := phase0.Slot(slotIdx)
 		blocks := bs.beaconIndexer.GetBlocksBySlot(slot)
 		for _, block := range blocks {
@@ -618,7 +913,7 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 			if blockHeader == nil {
 				continue
 			}
-			blockIndex := block.GetBlockIndex()
+			blockIndex := block.GetBlockIndex(ctx)
 			if blockIndex == nil {
 				continue
 			}
@@ -637,7 +932,37 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 				}
 			}
 
+			// filter by specific block UID
+			if len(filter.BlockUids) > 0 {
+				found := false
+				for _, blockUid := range filter.BlockUids {
+					if blockUid == block.BlockUID {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+			}
+
+			// filter by EL block number
+			if filter.EthBlockNumber != nil {
+				if blockIndex.ExecutionNumber != *filter.EthBlockNumber {
+					continue
+				}
+			}
+
+			// filter by EL block hash
+			if len(filter.EthBlockHash) > 0 {
+				if !bytes.Equal(blockIndex.ExecutionHash[:], filter.EthBlockHash) {
+					continue
+				}
+			}
+
 			isCanonical := bs.beaconIndexer.IsCanonicalBlockByHead(block, lastCanonicalBlock)
+			payloadStatus := bs.getPayloadStatus(ctx, block, lastCanonicalBlock, isCanonical)
+
 			if isCanonical {
 				lastCanonicalBlock = block
 			}
@@ -655,6 +980,17 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 
 			if filter.WithMissing == 2 {
 				// only missing blocks, skip
+				continue
+			}
+
+			// filter by payload status
+			if filter.WithPayloadMask&dbtypes.PayloadStatusMaskMissing == 0 && payloadStatus == dbtypes.PayloadStatusMissing {
+				continue
+			}
+			if filter.WithPayloadMask&dbtypes.PayloadStatusMaskCanonical == 0 && payloadStatus == dbtypes.PayloadStatusCanonical {
+				continue
+			}
+			if filter.WithPayloadMask&dbtypes.PayloadStatusMaskOrphaned == 0 && payloadStatus == dbtypes.PayloadStatusOrphaned {
 				continue
 			}
 
@@ -771,17 +1107,92 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 				}
 			}
 
+			// filter by builder index
+			if filter.BuilderIndex != nil {
+				builderIndex := blockIndex.BuilderIndex
+				// Convert uint64 to int64 for comparison (-1 means self-built/MaxUint64)
+				var builderIndexInt64 int64
+				if builderIndex == math.MaxUint64 {
+					builderIndexInt64 = -1
+				} else {
+					builderIndexInt64 = int64(builderIndex)
+				}
+				matches := builderIndexInt64 == *filter.BuilderIndex
+				if matches == filter.InvertBuilder {
+					continue
+				}
+			}
+
+			// filter by build source (self-built vs builder-built); mirrors the SQL clause in db/slots.go
+			if filter.WithBuilderBlock != 0 {
+				isSelfBuilt := blockIndex.BuilderIndex == math.MaxUint64
+				if filter.WithBuilderBlock == 1 && isSelfBuilt {
+					// builder-built blocks only
+					continue
+				}
+				if filter.WithBuilderBlock == 2 && !isSelfBuilt {
+					// self-built blocks only
+					continue
+				}
+			}
+
+			// filter by EL block parent hash
+			if len(filter.EthBlockParentHash) > 0 {
+				if !bytes.Equal(blockIndex.ExecutionParentHash[:], filter.EthBlockParentHash) {
+					continue
+				}
+			}
+
+			// filter by gas used
+			if filter.MinGasUsed != nil || filter.MaxGasUsed != nil {
+				gasUsed := blockIndex.GasUsed
+				if filter.MinGasUsed != nil && gasUsed < *filter.MinGasUsed {
+					continue
+				}
+				if filter.MaxGasUsed != nil && gasUsed > *filter.MaxGasUsed {
+					continue
+				}
+			}
+
+			// filter by gas limit
+			if filter.MinGasLimit != nil || filter.MaxGasLimit != nil {
+				gasLimit := blockIndex.GasLimit
+				if filter.MinGasLimit != nil && gasLimit < *filter.MinGasLimit {
+					continue
+				}
+				if filter.MaxGasLimit != nil && gasLimit > *filter.MaxGasLimit {
+					continue
+				}
+			}
+
+			// filter by block size
+			if filter.MinBlockSize != nil || filter.MaxBlockSize != nil {
+				blockSize := blockIndex.BlockSize
+				if filter.MinBlockSize != nil && blockSize < *filter.MinBlockSize {
+					continue
+				}
+				if filter.MaxBlockSize != nil && blockSize > *filter.MaxBlockSize {
+					continue
+				}
+			}
+
 			cachedMatches = append(cachedMatches, cachedDbBlock{
-				slot:     uint64(block.Slot),
-				proposer: uint64(blockHeader.Message.ProposerIndex),
-				orphaned: !isCanonical,
-				block:    block,
+				slot:          uint64(block.Slot),
+				proposer:      uint64(blockHeader.Message.ProposerIndex),
+				orphaned:      !isCanonical,
+				payloadStatus: payloadStatus,
+				block:         block,
 			})
 		}
 
 		// reconstruct missing blocks from epoch duties
 		// For slot/root filtering, we still need to check if we need missing blocks for that specific slot
-		shouldCheckMissing := filter.WithMissing != 0 && filter.Graffiti == "" && filter.ExtraData == "" && filter.WithOrphaned != 2 && filter.MinSyncParticipation == nil && filter.MaxSyncParticipation == nil && filter.MinExecTime == nil && filter.MaxExecTime == nil && filter.MinTxCount == nil && filter.MaxTxCount == nil && filter.MinBlobCount == nil && filter.MaxBlobCount == nil && len(filter.ForkIds) == 0
+		shouldCheckMissing := filter.WithMissing != 0 && filter.Graffiti == "" && filter.ExtraData == "" && filter.WithOrphaned != 2 &&
+			filter.MinSyncParticipation == nil && filter.MaxSyncParticipation == nil && filter.MinExecTime == nil && filter.MaxExecTime == nil &&
+			filter.MinTxCount == nil && filter.MaxTxCount == nil && filter.MinBlobCount == nil && filter.MaxBlobCount == nil && len(filter.ForkIds) == 0 &&
+			filter.BuilderIndex == nil && filter.WithBuilderBlock == 0 && filter.WithPayloadMask&dbtypes.PayloadStatusMaskMissing != 0 && len(filter.EthBlockParentHash) == 0 && filter.MinGasUsed == nil &&
+			filter.MaxGasUsed == nil && filter.MinGasLimit == nil && filter.MaxGasLimit == nil && filter.MinBlockSize == nil && filter.MaxBlockSize == nil &&
+			filter.WithMevBlock == 0
 
 		// If filtering by slot, only check missing for that specific slot
 		if filter.Slot != nil {
@@ -790,6 +1201,11 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 
 		// If filtering by block root, don't check missing (missing blocks don't have roots)
 		if len(filter.BlockRoot) > 0 {
+			shouldCheckMissing = false
+		}
+
+		// If filtering by block UID, don't check missing (missing blocks don't have UIDs)
+		if len(filter.BlockUids) > 0 {
 			shouldCheckMissing = false
 		}
 
@@ -888,6 +1304,7 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 			if block.block != nil {
 				if block.slot >= uint64(prunedSlot) {
 					assignedBlock.Block = block.block.GetDbBlock(bs.beaconIndexer, !block.orphaned)
+					assignedBlock.Block.PayloadStatus = block.payloadStatus
 				} else {
 					blockRoots = append(blockRoots, block.block.Root[:])
 					blockRootsIdx = append(blockRootsIdx, resIdx)
@@ -901,16 +1318,18 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 
 	// load pruned blocks from database
 	if len(blockRoots) > 0 {
-		blockMap := db.GetSlotsByRoots(blockRoots)
+		blockMap := db.GetSlotsByRoots(ctx, blockRoots)
 		if blockMap != nil {
 			for idx, blockRoot := range blockRoots {
 				if dbBlock, ok := blockMap[phase0.Root(blockRoot)]; ok {
+					cachedMatch := cachedMatches[blockRootsCachedId[idx]]
 
 					dbBlock.Status = dbtypes.Canonical
-					if cachedMatches[blockRootsCachedId[idx]].orphaned {
+					if cachedMatch.orphaned {
 						dbBlock.Status = dbtypes.Orphaned
 					}
 
+					dbBlock.PayloadStatus = cachedMatch.payloadStatus
 					resBlocks[blockRootsIdx[idx]].Block = dbBlock
 				}
 			}
@@ -921,6 +1340,27 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 		return resBlocks
 	}
 
+	// When filtering by BlockUids, remove UIDs already found in cache to avoid
+	// expensive full-table DB scans for UIDs that don't exist in finalized data.
+	if len(filter.BlockUids) > 0 {
+		foundUids := make(map[uint64]struct{}, len(cachedMatches))
+		for _, match := range cachedMatches {
+			if match.block != nil {
+				foundUids[match.block.BlockUID] = struct{}{}
+			}
+		}
+		remaining := make([]uint64, 0, len(filter.BlockUids))
+		for _, uid := range filter.BlockUids {
+			if _, found := foundUids[uid]; !found {
+				remaining = append(remaining, uid)
+			}
+		}
+		filter.BlockUids = remaining
+		if len(filter.BlockUids) == 0 {
+			return resBlocks
+		}
+	}
+
 	// load finalized slots from db
 	dbPage := uint64(0)
 	if pageIdx > cachedPages {
@@ -929,16 +1369,16 @@ func (bs *ChainService) GetDbBlocksByFilter(filter *dbtypes.BlockFilter, pageIdx
 	dbCacheOffset := uint64(pageSize) - (cachedMatchesLen % uint64(pageSize))
 	var dbBlocks []*dbtypes.AssignedSlot
 	if dbPage == 0 {
-		dbBlocks = db.GetFilteredSlots(filter, uint64(finalizedSlot), 0, uint32(dbCacheOffset)+1)
+		dbBlocks = db.GetFilteredSlots(ctx, filter, uint64(finalizedSlot), 0, uint32(dbCacheOffset)+1)
 	} else {
-		dbBlocks = db.GetFilteredSlots(filter, uint64(finalizedSlot), (dbPage-1)*uint64(pageSize)+dbCacheOffset, pageSize+1)
+		dbBlocks = db.GetFilteredSlots(ctx, filter, uint64(finalizedSlot), (dbPage-1)*uint64(pageSize)+dbCacheOffset, pageSize+1)
 	}
 	resBlocks = append(resBlocks, dbBlocks...)
 
 	return resBlocks
 }
 
-func (bs *ChainService) GetDbBlocksByParentRoot(parentRoot phase0.Root) []*dbtypes.Slot {
+func (bs *ChainService) GetDbBlocksByParentRoot(ctx context.Context, parentRoot phase0.Root) []*dbtypes.Slot {
 	parentBlock := bs.beaconIndexer.GetBlockByRoot(parentRoot)
 	cachedMatches := bs.beaconIndexer.GetBlockByParentRoot(parentRoot)
 	resBlocks := make([]*dbtypes.Slot, len(cachedMatches))
@@ -947,12 +1387,12 @@ func (bs *ChainService) GetDbBlocksByParentRoot(parentRoot phase0.Root) []*dbtyp
 		resBlocks[idx] = block.GetDbBlock(bs.beaconIndexer, isCanonical)
 	}
 	if parentBlock == nil {
-		resBlocks = append(resBlocks, db.GetSlotsByParentRoot(parentRoot[:])...)
+		resBlocks = append(resBlocks, db.GetSlotsByParentRoot(ctx, parentRoot[:])...)
 	}
 	return resBlocks
 }
 
-func (bs *ChainService) CheckBlockOrphanedStatus(blockRoot phase0.Root) dbtypes.SlotStatus {
+func (bs *ChainService) CheckBlockOrphanedStatus(ctx context.Context, blockRoot phase0.Root) dbtypes.SlotStatus {
 	cachedBlock := bs.beaconIndexer.GetBlockByRoot(blockRoot)
 	if cachedBlock != nil {
 		if bs.beaconIndexer.IsCanonicalBlock(cachedBlock, nil) {
@@ -961,7 +1401,7 @@ func (bs *ChainService) CheckBlockOrphanedStatus(blockRoot phase0.Root) dbtypes.
 			return dbtypes.Orphaned
 		}
 	}
-	dbRefs := db.GetSlotStatus([][]byte{blockRoot[:]})
+	dbRefs := db.GetSlotStatus(ctx, [][]byte{blockRoot[:]})
 	if len(dbRefs) > 0 {
 		return dbRefs[0].Status
 	}
@@ -969,14 +1409,17 @@ func (bs *ChainService) CheckBlockOrphanedStatus(blockRoot phase0.Root) dbtypes.
 	return dbtypes.Missing
 }
 
-func (bs *ChainService) GetHighestElBlockNumber(overrideForkId *beacon.ForkKey) uint64 {
+func (bs *ChainService) GetHighestElBlockNumber(ctx context.Context, overrideForkId *beacon.ForkKey) uint64 {
 	canonicalHead := bs.beaconIndexer.GetCanonicalHead(overrideForkId)
 	for {
 		if canonicalHead == nil {
 			break
 		}
-		if canonicalHead.GetBlockIndex() != nil {
-			return canonicalHead.GetBlockIndex().ExecutionNumber
+		// In Gloas/ePBS the execution payload is decoupled from the beacon block and may not be
+		// revealed yet for the most recent canonical head(s), in which case ExecutionNumber is 0.
+		// Walk back to the latest block that actually carries an execution number.
+		if blockIndex := canonicalHead.GetBlockIndex(ctx); blockIndex != nil && blockIndex.ExecutionNumber > 0 {
+			return blockIndex.ExecutionNumber
 		}
 
 		parentRoot := canonicalHead.GetParentRoot()

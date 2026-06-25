@@ -8,12 +8,12 @@ import (
 	"strconv"
 	"strings"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -46,6 +46,7 @@ type APIDepositQueueInfo struct {
 	ValidatorStatus       string `json:"validator_status"`
 	Amount                uint64 `json:"amount"`
 	WithdrawalCredentials string `json:"withdrawal_credentials"`
+	Postponed             bool   `json:"postponed"`
 	TxHash                string `json:"tx_hash,omitempty"`
 	TxOrigin              string `json:"tx_origin,omitempty"`
 	TxTarget              string `json:"tx_target,omitempty"`
@@ -156,7 +157,7 @@ func APIDepositsQueueV1(w http.ResponseWriter, r *http.Request) {
 	if isElectra {
 		// Get queued deposits for Electra
 		headBlock := services.GlobalBeaconService.GetBeaconIndexer().GetCanonicalHead(nil)
-		queuedDeposits := services.GlobalBeaconService.GetIndexedDepositQueue(headBlock)
+		queuedDeposits := services.GlobalBeaconService.GetIndexedDepositQueue(r.Context(), headBlock)
 
 		if queuedDeposits != nil && len(queuedDeposits.Queue) > 0 {
 			totalNewValidators = queuedDeposits.TotalNew
@@ -219,13 +220,19 @@ func APIDepositsQueueV1(w http.ResponseWriter, r *http.Request) {
 
 				// Get transaction details for these deposits
 				txDetailsMap := map[uint64]*dbtypes.DepositTx{}
-				for _, txDetail := range db.GetDepositTxsByIndexes(depositIndexes) {
+				for _, txDetail := range db.GetDepositTxsByIndexes(r.Context(), depositIndexes) {
 					txDetailsMap[txDetail.Index] = txDetail
 				}
 
 				for _, item := range selectedEntries {
 					queueEntry := item.entry
-					estimatedTime := chainState.EpochToTime(queueEntry.EpochEstimate).Unix()
+
+					// EpochEstimate is the churn-based epoch for normal deposits and the
+					// validator's withdrawable epoch for postponed ones; 0 means unknown.
+					estimatedTime := int64(0)
+					if queueEntry.EpochEstimate > 0 {
+						estimatedTime = chainState.EpochToTime(queueEntry.EpochEstimate).Unix()
+					}
 
 					depositInfo := &APIDepositQueueInfo{
 						QueuePosition:         queueEntry.QueuePos,
@@ -233,6 +240,7 @@ func APIDepositsQueueV1(w http.ResponseWriter, r *http.Request) {
 						PublicKey:             fmt.Sprintf("0x%x", queueEntry.PendingDeposit.Pubkey[:]),
 						WithdrawalCredentials: fmt.Sprintf("0x%x", queueEntry.PendingDeposit.WithdrawalCredentials[:]),
 						Amount:                uint64(queueEntry.PendingDeposit.Amount),
+						Postponed:             queueEntry.Postponed,
 					}
 
 					// Set transaction details if available

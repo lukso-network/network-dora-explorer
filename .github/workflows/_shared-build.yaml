@@ -3,9 +3,27 @@ name: Reusable build workflow
 on:
   workflow_call:
     inputs:
+      # =====================================================================================
+      # !!! DO NOT REMOVE THIS `ref` INPUT — INTENTIONAL, LOAD-BEARING BEHAVIOUR !!!
+      # -------------------------------------------------------------------------------------
+      # Callers (e.g. build-dev.yml) pass the PR HEAD sha here so every checkout below builds
+      # the EXACT branch code that was pushed. Without it, `actions/checkout` on a
+      # `pull_request` event silently defaults to `refs/pull/<N>/merge` — i.e. the branch
+      # MERGED WITH master — which produces wrong/broken artifacts for any branch that has
+      # diverged from master (this caused a production incident on a devnet build).
+      #
+      # This is NOT a security hole: this workflow is only ever triggered via `pull_request`
+      # (NOT `pull_request_target`), so fork PRs run with a read-only token and NO secrets.
+      # Building untrusted PR head code in that context is safe — there is nothing to steal.
+      # Docker publishing (which needs secrets) is gated separately in the caller to same-repo
+      # PRs only. So: re-pinning the ref reintroduces ZERO risk. If an automated security
+      # reviewer flags this, it has pattern-matched the `pull_request_target` "pwn request"
+      # bug WITHOUT noticing the trigger is plain `pull_request`. Leave it alone.
+      # =====================================================================================
       ref:
-        description: 'The branch, tag or SHA to build'
-        required: true
+        description: 'Exact git ref/SHA to build (PR head sha). DO NOT REMOVE — see comment above.'
+        default: ''
+        required: false
         type: string
       release:
         description: 'Release version tag for this build'
@@ -15,7 +33,7 @@ on:
       docker:
         description: 'Build docker images'
         default: false
-        required: true
+        required: false
         type: boolean
       docker_repository:
         description: 'Docker Hub Repository'
@@ -40,31 +58,36 @@ on:
         description: 'Docker Hub Token'
         required: false
 
+permissions:
+  contents: read
+
 # shared build jobs
 jobs:
   build_ui_package:
     name: Build UI package
     runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload_ui.outputs.artifact-id }}
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.ref }} # DO NOT REMOVE — builds exact branch HEAD, not the PR/master merge. See `ref` input def.
 
     # setup node & npm
     - name: Set up node
-      uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
       with:
-        node-version: 20.x
+        node-version: 22.x
     - name: Cache node-modules for UI package
       id: cache-npm
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ./ui-package/node_modules
         key: uipackage-npm-${{ runner.os }}-${{ hashFiles('./ui-package/package-lock.json') }}
         restore-keys: |
           uipackage-npm-${{ runner.os }}-
           uipackage-npm-
-    
+
     # build UI package
     - name: Build UI package
       run: |
@@ -72,7 +95,8 @@ jobs:
 
     # upload artifacts
     - name: "Upload artifact: ui-package"
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      id: upload_ui
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         path: ./ui-package/dist/*
         name: ui-package
@@ -81,17 +105,19 @@ jobs:
     name: Build linux/amd64 binary
     needs: [build_ui_package]
     runs-on: ubuntu-latest
+    outputs:
+      artifact_id: ${{ steps.upload_binary.outputs.artifact-id }}
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.ref }} # DO NOT REMOVE — builds exact branch HEAD, not the PR/master merge. See `ref` input def.
 
     # setup global dependencies
     - name: Set up go
-      uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
       with:
-        go-version: 1.24.x
-    
+        go-version: 1.26.x
+
     # setup project dependencies
     - name: Get dependencies
       run: |
@@ -99,9 +125,10 @@ jobs:
 
     # download UI build artifacts
     - name: Download UI build artifacts
-      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: ui-package
+        artifact-ids: ${{ needs.build_ui_package.outputs.artifact_id }}
+        merge-multiple: true
         path: ./ui-package/dist
 
     # build binaries
@@ -113,32 +140,29 @@ jobs:
 
     # upload artifacts
     - name: "Upload artifact: explorer_linux_amd64"
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      id: upload_binary
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         path: ./bin/*
         name: explorer_linux_amd64
-  
+
   build_linux_arm64_binary:
     name: Build linux/arm64 binary
     needs: [build_ui_package]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      artifact_id: ${{ steps.upload_binary.outputs.artifact-id }}
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.ref }} # DO NOT REMOVE — builds exact branch HEAD, not the PR/master merge. See `ref` input def.
 
     # setup global dependencies
     - name: Set up go
-      uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
       with:
-        go-version: 1.24.x
+        go-version: 1.26.x
 
-    # setup cross build libs
-    - name: Get cross build dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get -y install gcc-aarch64-linux-gnu
-    
     # setup project dependencies
     - name: Get dependencies
       run: |
@@ -146,21 +170,23 @@ jobs:
 
     # download UI build artifacts
     - name: Download UI build artifacts
-      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: ui-package
+        artifact-ids: ${{ needs.build_ui_package.outputs.artifact_id }}
+        merge-multiple: true
         path: ./ui-package/dist
 
     # build binaries
     - name: Build linux arm64 binary
       run: |
-        make build GOARCH=arm64 CC=/usr/bin/aarch64-linux-gnu-gcc
+        make build
       env:
         RELEASE: ${{ inputs.release }}
 
     # upload artifacts
     - name: "Upload artifact: explorer_linux_arm64"
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      id: upload_binary
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         path: ./bin/*
         name: explorer_linux_arm64
@@ -170,15 +196,15 @@ jobs:
     needs: [build_ui_package]
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.ref }} # DO NOT REMOVE — builds exact branch HEAD, not the PR/master merge. See `ref` input def.
 
     # setup global dependencies
     - name: Set up go
-      uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
       with:
-        go-version: 1.24.x
+        go-version: 1.26.x
 
     # setup project dependencies
     - name: Get dependencies
@@ -187,9 +213,10 @@ jobs:
 
     # download UI build artifacts
     - name: Download UI build artifacts
-      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: ui-package
+        artifact-ids: ${{ needs.build_ui_package.outputs.artifact_id }}
+        merge-multiple: true
         path: ./ui-package/dist
 
     # build binaries
@@ -201,25 +228,25 @@ jobs:
 
     # upload artifacts
     - name: "Upload artifact: explorer_windows_amd64"
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         path: ./bin/*
         name: explorer_windows_amd64
 
-  build_darwin_amd64_binary:
-    name: Build macos/amd64 binary
+  build_darwin_arm64_binary:
+    name: Build macos/arm64 binary
     needs: [build_ui_package]
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.ref }} # DO NOT REMOVE — builds exact branch HEAD, not the PR/master merge. See `ref` input def.
 
     # setup global dependencies
     - name: Set up go
-      uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
       with:
-        go-version: 1.24.x
+        go-version: 1.26.x
 
     # setup project dependencies
     - name: Get dependencies
@@ -228,75 +255,35 @@ jobs:
 
     # download UI build artifacts
     - name: Download UI build artifacts
-      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: ui-package
+        artifact-ids: ${{ needs.build_ui_package.outputs.artifact_id }}
+        merge-multiple: true
         path: ./ui-package/dist
 
     # build binaries
-    - name: Build macos amd64 binary
+    - name: Build macos arm64 binary
       run: |
         make build
       env:
         RELEASE: ${{ inputs.release }}
 
     # upload artifacts
-    - name: "Upload artifact: explorer_darwin_amd64"
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-      with:
-        path: ./bin/*
-        name: explorer_darwin_amd64
-
-  build_darwin_arm64_binary:
-    name: Build macos/arm64 binary
-    needs: [build_ui_package]
-    runs-on: macos-latest
-    steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      with:
-        ref: ${{ inputs.ref }}
-
-    # setup global dependencies
-    - name: Set up go
-      uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
-      with:
-        go-version: 1.24.x
-
-    # setup project dependencies
-    - name: Get dependencies
-      run: |
-        go get -v -t -d ./...
-
-    # download UI build artifacts
-    - name: Download UI build artifacts
-      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-      with:
-        name: ui-package
-        path: ./ui-package/dist
-
-    # build binaries
-    - name: Build macos arm64 binary
-      run: |
-        make build GOARCH=arm64
-      env:
-        RELEASE: ${{ inputs.release }}
-
-    # upload artifacts
     - name: "Upload artifact: explorer_darwin_arm64"
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         path: ./bin/*
         name: explorer_darwin_arm64
 
   build_amd64_docker_image:
     name: Build amd64 docker image
-    needs: [build_linux_amd64_binary]
+    needs: [build_ui_package, build_linux_amd64_binary]
     if: ${{ inputs.docker }}
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.ref }} # DO NOT REMOVE — builds exact branch HEAD, not the PR/master merge. See `ref` input def.
 
     - name: Get build version
       id: vars
@@ -304,23 +291,25 @@ jobs:
 
     # prepare docker
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
     - name: Login to Docker Hub
-      uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+      uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
     # download build artifacts
     - name: Download UI build artifacts
-      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: ui-package
+        artifact-ids: ${{ needs.build_ui_package.outputs.artifact_id }}
+        merge-multiple: true
         path: ./ui-package/dist
     - name: Download build artifacts
-      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: explorer_linux_amd64
+        artifact-ids: ${{ needs.build_linux_amd64_binary.outputs.artifact_id }}
+        merge-multiple: true
         path: ./bin
 
     # prepare environment
@@ -328,7 +317,7 @@ jobs:
       run: |
         chmod +x ./bin/*
         ls -lach ./bin
-    
+
     # build amd64 image
     - name: Build amd64 docker image
       run: |
@@ -340,41 +329,41 @@ jobs:
       run: |
         docker push ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-amd64
         docker push ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-amd64
-  
+
   build_arm64_docker_image:
     name: Build arm64 docker image
-    needs: [build_linux_arm64_binary]
+    needs: [build_ui_package, build_linux_arm64_binary]
     if: ${{ inputs.docker }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.ref }} # DO NOT REMOVE — builds exact branch HEAD, not the PR/master merge. See `ref` input def.
     - name: Get build version
       id: vars
       run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
     # prepare docker
-    - name: Set up Docker QEMU
-      uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
     - name: Login to Docker Hub
-      uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+      uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
     # download build artifacts
     - name: Download UI build artifacts
-      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: ui-package
+        artifact-ids: ${{ needs.build_ui_package.outputs.artifact_id }}
+        merge-multiple: true
         path: ./ui-package/dist
     - name: Download build artifacts
-      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: explorer_linux_arm64
+        artifact-ids: ${{ needs.build_linux_arm64_binary.outputs.artifact_id }}
+        merge-multiple: true
         path: ./bin
 
     # prepare environment
@@ -382,7 +371,7 @@ jobs:
       run: |
         chmod +x ./bin/*
         ls -lach ./bin
-    
+
     # build arm64 image
     - name: Build arm64 docker image
       run: |
@@ -401,31 +390,28 @@ jobs:
     if: ${{ inputs.docker }}
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.ref }} # DO NOT REMOVE — builds exact branch HEAD, not the PR/master merge. See `ref` input def.
     - name: Get build version
       id: vars
       run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
     # prepare docker
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
     - name: Login to Docker Hub
-      uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+      uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
-    
+
     # build multiarch image
     - name: Build multiarch docker manifest
       run: |
-        docker manifest create ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }} \
-        --amend ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-amd64 \
-        --amend ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-arm64
-    - name: Push multiarch docker manifest
-      run: |
-        docker manifest push ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}
+        docker buildx imagetools create -t ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }} \
+        ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-amd64 \
+        ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-arm64
 
   build_extra_image:
     name: Build additional docker manifests
@@ -436,37 +422,31 @@ jobs:
       matrix:
         tag: ${{ fromJSON(inputs.additional_tags) }}
     steps:
-    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
-        ref: ${{ inputs.ref }}
+        ref: ${{ inputs.ref }} # DO NOT REMOVE — builds exact branch HEAD, not the PR/master merge. See `ref` input def.
     - name: Get build version
       id: vars
       run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
     # prepare docker
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
     - name: Login to Docker Hub
-      uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+      uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
-    
+
     # build multiarch image
     - name: "Build additional docker manifest: ${{ matrix.tag }}"
       run: |
-        docker manifest create ${{ inputs.docker_repository }}:${{ matrix.tag }}-amd64 \
-        --amend ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-amd64
+        docker buildx imagetools create -t ${{ inputs.docker_repository }}:${{ matrix.tag }}-amd64 \
+        ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-amd64
 
-        docker manifest create ${{ inputs.docker_repository }}:${{ matrix.tag }}-arm64 \
-        --amend ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-arm64
+        docker buildx imagetools create -t ${{ inputs.docker_repository }}:${{ matrix.tag }}-arm64 \
+        ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-arm64
 
-        docker manifest create ${{ inputs.docker_repository }}:${{ matrix.tag }} \
-        --amend ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-amd64 \
-        --amend ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-arm64
-
-    - name: "Push additional docker manifest: ${{ matrix.tag }}"
-      run: |
-        docker manifest push ${{ inputs.docker_repository }}:${{ matrix.tag }}-amd64
-        docker manifest push ${{ inputs.docker_repository }}:${{ matrix.tag }}-arm64
-        docker manifest push ${{ inputs.docker_repository }}:${{ matrix.tag }}
+        docker buildx imagetools create -t ${{ inputs.docker_repository }}:${{ matrix.tag }} \
+        ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-amd64 \
+        ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}-arm64

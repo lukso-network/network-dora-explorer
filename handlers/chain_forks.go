@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,13 +9,13 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/indexer/beacon"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -22,8 +23,8 @@ import (
 func getDefaultChainForksPageSize() uint64 {
 	chainState := services.GlobalBeaconService.GetChainState()
 	specs := chainState.GetSpecs()
-	secondsPerEpoch := specs.SlotsPerEpoch * specs.SecondsPerSlot
-	return uint64(24*3600) / secondsPerEpoch // 1 day worth of epochs
+	msPerEpoch := specs.SlotsPerEpoch * specs.SlotDurationMs
+	return uint64(24*3600*1000) / msPerEpoch // 1 day worth of epochs
 }
 
 // ChainForks will return the chain forks visualization page using a go template
@@ -50,8 +51,8 @@ func ChainForks(w http.ResponseWriter, r *http.Request) {
 			// Calculate max allowed epochs (14 days)
 			chainState := services.GlobalBeaconService.GetChainState()
 			specs := chainState.GetSpecs()
-			secondsPerEpoch := specs.SlotsPerEpoch * specs.SecondsPerSlot
-			maxEpochs := uint64(14*24*3600) / secondsPerEpoch
+			msPerEpoch := specs.SlotsPerEpoch * specs.SlotDurationMs
+			maxEpochs := uint64(14*24*3600*1000) / msPerEpoch
 
 			if parsed <= maxEpochs {
 				pageSizeEpochs = parsed
@@ -122,18 +123,18 @@ func getChainForksPageData() (*models.ChainForksPageData, error) {
 	genesis := chainState.GetGenesis()
 
 	// Calculate epoch counts for time selectors
-	secondsPerEpoch := specs.SlotsPerEpoch * specs.SecondsPerSlot
+	msPerEpoch := specs.SlotsPerEpoch * specs.SlotDurationMs
 
 	pageData := &models.ChainForksPageData{
 		ChainSpecs: &models.ChainSpecs{
 			SlotsPerEpoch:  uint64(specs.SlotsPerEpoch),
-			SecondsPerSlot: uint64(specs.SecondsPerSlot),
+			SlotDurationMs: specs.SlotDurationMs,
 			GenesisTime:    uint64(genesis.GenesisTime.Unix()),
 			CurrentSlot:    uint64(chainState.CurrentSlot()),
-			EpochsFor12h:   uint64(12*3600) / secondsPerEpoch,
-			EpochsFor1d:    uint64(24*3600) / secondsPerEpoch,
-			EpochsFor7d:    uint64(7*24*3600) / secondsPerEpoch,
-			EpochsFor14d:   uint64(14*24*3600) / secondsPerEpoch,
+			EpochsFor12h:   uint64(12*3600*1000) / msPerEpoch,
+			EpochsFor1d:    uint64(24*3600*1000) / msPerEpoch,
+			EpochsFor7d:    uint64(7*24*3600*1000) / msPerEpoch,
+			EpochsFor14d:   uint64(14*24*3600*1000) / msPerEpoch,
 		},
 	}
 
@@ -146,7 +147,7 @@ func getChainForksDiagramData(startSlot uint64, pageSizeEpochs uint64, cacheSlot
 	diagramData := &models.ChainForksDiagramData{}
 
 	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(diagramCacheKey, true, diagramData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
-		diagramData, cacheTimeout := buildChainForksDiagramData(startSlot, pageSizeEpochs, originalStart, originalPageSizeEpochs)
+		diagramData, cacheTimeout := buildChainForksDiagramData(pageCall.CallCtx, startSlot, pageSizeEpochs, originalStart, originalPageSizeEpochs)
 		pageCall.CacheTimeout = cacheTimeout
 		return diagramData
 	})
@@ -161,7 +162,7 @@ func getChainForksDiagramData(startSlot uint64, pageSizeEpochs uint64, cacheSlot
 	return diagramData, pageErr
 }
 
-func buildChainForksDiagramData(startSlot uint64, pageSizeEpochs uint64, originalStart uint64, originalPageSizeEpochs uint64) (*models.ChainForksDiagramData, time.Duration) {
+func buildChainForksDiagramData(ctx context.Context, startSlot uint64, pageSizeEpochs uint64, originalStart uint64, originalPageSizeEpochs uint64) (*models.ChainForksDiagramData, time.Duration) {
 	chainState := services.GlobalBeaconService.GetChainState()
 	specs := chainState.GetSpecs()
 	currentSlot := uint64(chainState.CurrentSlot())
@@ -183,13 +184,13 @@ func buildChainForksDiagramData(startSlot uint64, pageSizeEpochs uint64, origina
 
 	var cacheTime time.Duration
 	if startSlot > finalizedSlot {
-		cacheTime = time.Duration(specs.SecondsPerSlot) * 12 * time.Second
+		cacheTime = time.Duration(specs.SlotDurationMs) * 12 * time.Millisecond
 	} else {
 		cacheTime = 30 * time.Minute
 	}
 
 	// Get fork data from database
-	dbForks, err := db.GetForkVisualizationData(actualStartSlot, endSlot)
+	dbForks, err := db.GetForkVisualizationData(ctx, actualStartSlot, endSlot)
 	if err != nil {
 		logrus.Errorf("Error fetching fork visualization data: %v", err)
 		return &models.ChainForksDiagramData{
@@ -209,7 +210,7 @@ func buildChainForksDiagramData(startSlot uint64, pageSizeEpochs uint64, origina
 
 	// Process forks with epoch-based participation data
 	indexer := services.GlobalBeaconService.GetBeaconIndexer()
-	forks, err := processForksWithEpochData(dbForks, indexer, startEpoch, endEpoch)
+	forks, err := processForksWithEpochData(ctx, dbForks, indexer, startEpoch, endEpoch)
 	if err != nil {
 		logrus.Errorf("Error processing forks with epoch-based participation data: %v", err)
 		return &models.ChainForksDiagramData{
@@ -414,7 +415,7 @@ func buildChainDiagram(forks []*models.ChainFork, startEpoch, endEpoch uint64, i
 }
 
 // processForksWithEpochData converts database forks to page data with epoch-based participation
-func processForksWithEpochData(dbForks []*dbtypes.Fork, indexer *beacon.Indexer, startEpoch, endEpoch uint64) ([]*models.ChainFork, error) {
+func processForksWithEpochData(ctx context.Context, dbForks []*dbtypes.Fork, indexer *beacon.Indexer, startEpoch, endEpoch uint64) ([]*models.ChainFork, error) {
 	forks := make([]*models.ChainFork, 0, len(dbForks)+1)
 
 	// Build child fork map
@@ -467,7 +468,7 @@ func processForksWithEpochData(dbForks []*dbtypes.Fork, indexer *beacon.Indexer,
 			finalizedEndEpoch = uint64(finalizedEpoch)
 		}
 
-		finalizedData, err := db.GetFinalizedEpochParticipation(startEpoch, finalizedEndEpoch)
+		finalizedData, err := db.GetFinalizedEpochParticipation(ctx, startEpoch, finalizedEndEpoch)
 		if err != nil {
 			return nil, err
 		}
@@ -498,7 +499,7 @@ func processForksWithEpochData(dbForks []*dbtypes.Fork, indexer *beacon.Indexer,
 		}
 
 		if unfinalizedStartEpoch <= unfinalizedEndEpoch {
-			unfinalizedData, err := db.GetUnfinalizedEpochParticipation(unfinalizedStartEpoch, unfinalizedEndEpoch)
+			unfinalizedData, err := db.GetUnfinalizedEpochParticipation(ctx, unfinalizedStartEpoch, unfinalizedEndEpoch)
 			if err != nil {
 				return nil, err
 			}
@@ -518,7 +519,7 @@ func processForksWithEpochData(dbForks []*dbtypes.Fork, indexer *beacon.Indexer,
 	}
 
 	// 3. Fetch orphaned epoch participation data for non-canonical finalized epochs
-	orphanedEpochData, err := db.GetOrphanedEpochParticipation(startEpoch, endEpoch)
+	orphanedEpochData, err := db.GetOrphanedEpochParticipation(ctx, startEpoch, endEpoch)
 	if err != nil {
 		return nil, err
 	}
@@ -634,7 +635,7 @@ func processForksWithEpochData(dbForks []*dbtypes.Fork, indexer *beacon.Indexer,
 	if endEpoch > uint64(finalizedEpoch) {
 		blockCountEndSlot = finalizedSlot
 	}
-	blockCounts, err := db.GetForkBlockCounts(uint64(blockCountStartSlot), uint64(blockCountEndSlot))
+	blockCounts, err := db.GetForkBlockCounts(ctx, uint64(blockCountStartSlot), uint64(blockCountEndSlot))
 	if err != nil {
 		return nil, err
 	}

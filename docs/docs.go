@@ -425,6 +425,16 @@ const docTemplate = `{
                         "description": "Filter by signature validity (0=invalid only, 1=valid only, 2=all)",
                         "name": "with_valid",
                         "in": "query"
+                    },
+                    {
+                        "type": "array",
+                        "items": {
+                            "type": "integer"
+                        },
+                        "collectionFormat": "multi",
+                        "description": "Filter by withdrawal credential type prefix byte (0-3). Repeat the parameter to include multiple types, e.g. cred_type=1\u0026cred_type=2.",
+                        "name": "cred_type",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -865,6 +875,36 @@ const docTemplate = `{
                 }
             }
         },
+        "/v1/network/client_head_forks": {
+            "get": {
+                "description": "Returns information about consensus client head forks, showing which clients are on which chain head. Useful for detecting chain splits from the client perspective.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "network"
+                ],
+                "summary": "Get consensus client head forks",
+                "operationId": "getNetworkClientHeadForks",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.APIClientHeadForksResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/v1/network/forks": {
             "get": {
                 "description": "Returns comprehensive information about past, current, and future network forks including consensus forks and BPO (Block Parameter Override) forks with fork digests",
@@ -900,7 +940,7 @@ const docTemplate = `{
         },
         "/v1/network/overview": {
             "get": {
-                "description": "Returns comprehensive network state information including network info, current state, checkpoints, validator stats, queue stats, and fork information",
+                "description": "Returns comprehensive network state information including network info, current state, checkpoints, validator stats, queue stats, fork information and a health snapshot with finality status, validator counts and provenance-aware participation data",
                 "consumes": [
                     "application/json"
                 ],
@@ -920,12 +960,9 @@ const docTemplate = `{
                         }
                     },
                     "500": {
-                        "description": "Internal server error",
+                        "description": "Server Error",
                         "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
+                            "$ref": "#/definitions/api.ApiResponse"
                         }
                     }
                 }
@@ -1133,6 +1170,291 @@ const docTemplate = `{
                 }
             }
         },
+        "/v1/slot/{slotOrHash}/bids": {
+            "get": {
+                "description": "Returns the execution payload bids submitted for a slot's parent root (ePBS, gloas+).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Slot"
+                ],
+                "summary": "Get execution payload bids for a slot",
+                "operationId": "getSlotBids",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Slot number or block root (0x-prefixed hex)",
+                        "name": "slotOrHash",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.APISlotBidsResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid slot number or root format",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Slot not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/slot/{slotOrHash}/block_access_list": {
+            "get": {
+                "description": "Returns the EIP-7928 block access list (BAL) decoded for a specific slot.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Slot"
+                ],
+                "summary": "Get block access list for a slot",
+                "operationId": "getSlotBlockAccessList",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Slot number or block root (0x-prefixed hex)",
+                        "name": "slotOrHash",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.APISlotBlockAccessListResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid slot number or root format",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Slot not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/slot/{slotOrHash}/inclusion_lists": {
+            "get": {
+                "description": "Returns the cached EIP-7805 inclusion lists for a slot, with each transaction\nmarked as included or not based on whether it appears in the slot's block transactions.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Slot"
+                ],
+                "summary": "Get inclusion lists for a slot",
+                "operationId": "getSlotInclusionLists",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Slot number or block root (0x-prefixed hex)",
+                        "name": "slotOrHash",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.APISlotInclusionListsResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid slot number or root format",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Slot not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/slot/{slotOrHash}/payload_header": {
+            "get": {
+                "description": "Returns the gloas+ signed execution payload bid (header) included in a block,\nplus its observed payload status (canonical / orphaned). Pre-gloas blocks return\nhas_payload_header=false.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Slot"
+                ],
+                "summary": "Get the execution payload header for a slot",
+                "operationId": "getSlotPayloadHeader",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Slot number or block root (0x-prefixed hex)",
+                        "name": "slotOrHash",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.APISlotPayloadHeaderResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid slot number or root format",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Slot not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/slot/{slotOrHash}/ptc_votes": {
+            "get": {
+                "description": "Returns the PTC (Payload Timeliness Committee) payload attestations included in a gloas+ block.\nThe attestations target the previous slot, mirroring what is shown on the slot page.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Slot"
+                ],
+                "summary": "Get PTC votes for a slot",
+                "operationId": "getSlotPtcVotes",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Slot number or block root (0x-prefixed hex)",
+                        "name": "slotOrHash",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/api.APISlotPtcVotesResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid slot number or root format",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Slot not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/v1/slots": {
             "get": {
                 "description": "Returns a list of slots with various filtering options, sorted by slot number descending",
@@ -1255,13 +1577,25 @@ const docTemplate = `{
                     },
                     {
                         "type": "integer",
-                        "description": "Start slot for pagination (inclusive)",
-                        "name": "start_slot",
+                        "description": "Minimum slot number to return (inclusive)",
+                        "name": "min_slot",
                         "in": "query"
                     },
                     {
                         "type": "integer",
-                        "description": "Number of results to return (max 100, default 100)",
+                        "description": "Maximum slot number to return (inclusive)",
+                        "name": "max_slot",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page number for pagination (0-indexed, default 0)",
+                        "name": "page",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Number of results to return (max 1000, default 100)",
                         "name": "limit",
                         "in": "query"
                     }
@@ -1754,6 +2088,12 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
+                        "description": "Filter by withdrawal address or withdrawal credentials",
+                        "name": "withdrawal",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
                         "description": "Sort order: index, index-d, pubkey, pubkey-d, balance, balance-d, activation, activation-d, exit, exit-d",
                         "name": "order",
                         "in": "query"
@@ -1816,13 +2156,13 @@ const docTemplate = `{
                     },
                     {
                         "type": "integer",
-                        "description": "Grouping option: 1=by 100k indexes, 2=by 10k indexes, 3=by validator names (default: 3 if names available, else 1)",
+                        "description": "Grouping option: 1=by 100k indexes, 2=by 10k indexes, 3=by validator names, 4=by withdrawal address (default: 3 if names available, else 1)",
                         "name": "group",
                         "in": "query"
                     },
                     {
                         "type": "string",
-                        "description": "Search term for group names (supports regex)",
+                        "description": "Search term for group names, withdrawal addresses, or withdrawal credentials (supports regex for non-exact address searches)",
                         "name": "search",
                         "in": "query"
                     },
@@ -2082,6 +2422,80 @@ const docTemplate = `{
                 }
             }
         },
+        "api.APIClientHeadFork": {
+            "type": "object",
+            "properties": {
+                "client_count": {
+                    "type": "integer"
+                },
+                "clients": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APIClientHeadForkPeer"
+                    }
+                },
+                "head_root": {
+                    "type": "string"
+                },
+                "head_slot": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.APIClientHeadForkPeer": {
+            "type": "object",
+            "properties": {
+                "distance": {
+                    "type": "integer"
+                },
+                "head_slot": {
+                    "type": "integer"
+                },
+                "index": {
+                    "type": "integer"
+                },
+                "last_error": {
+                    "type": "string"
+                },
+                "last_refresh": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                },
+                "version": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.APIClientHeadForksData": {
+            "type": "object",
+            "properties": {
+                "fork_count": {
+                    "type": "integer"
+                },
+                "forks": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APIClientHeadFork"
+                    }
+                }
+            }
+        },
+        "api.APIClientHeadForksResponse": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "$ref": "#/definitions/api.APIClientHeadForksData"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
         "api.APIConsensusClientMetadata": {
             "type": "object",
             "properties": {
@@ -2304,10 +2718,10 @@ const docTemplate = `{
                 "current_slot": {
                     "type": "integer"
                 },
-                "seconds_per_epoch": {
+                "epoch_duration_ms": {
                     "type": "integer"
                 },
-                "seconds_per_slot": {
+                "slot_duration_ms": {
                     "type": "integer"
                 },
                 "slots_per_epoch": {
@@ -2594,6 +3008,9 @@ const docTemplate = `{
                 },
                 "index": {
                     "type": "integer"
+                },
+                "postponed": {
+                    "type": "boolean"
                 },
                 "public_key": {
                     "type": "string"
@@ -3275,11 +3692,38 @@ const docTemplate = `{
         "api.APINetworkOverviewData": {
             "type": "object",
             "properties": {
+                "active_validator_count": {
+                    "type": "integer"
+                },
                 "checkpoints": {
                     "$ref": "#/definitions/api.APICheckpoints"
                 },
+                "current_epoch": {
+                    "type": "integer"
+                },
+                "current_slot": {
+                    "type": "integer"
+                },
                 "current_state": {
                     "$ref": "#/definitions/api.APICurrentState"
+                },
+                "data_quality_warnings": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "epochs_since_finality": {
+                    "type": "integer"
+                },
+                "exited_validator_count": {
+                    "type": "integer"
+                },
+                "finalized_epoch": {
+                    "type": "integer"
+                },
+                "finalizing": {
+                    "type": "boolean"
                 },
                 "forks": {
                     "type": "array",
@@ -3290,14 +3734,37 @@ const docTemplate = `{
                 "is_synced": {
                     "type": "boolean"
                 },
+                "metadata": {
+                    "$ref": "#/definitions/api.APINetworkOverviewMetadata"
+                },
                 "network_info": {
                     "$ref": "#/definitions/api.APINetworkInfo"
+                },
+                "participation": {
+                    "$ref": "#/definitions/api.APINetworkParticipation"
+                },
+                "pending_validator_count": {
+                    "type": "integer"
                 },
                 "queue_stats": {
                     "$ref": "#/definitions/api.APIQueueStats"
                 },
+                "raw_aggregates": {
+                    "$ref": "#/definitions/api.APINetworkRawAggregates"
+                },
+                "total_validator_count": {
+                    "type": "integer"
+                },
                 "validator_stats": {
                     "$ref": "#/definitions/api.APIValidatorStats"
+                }
+            }
+        },
+        "api.APINetworkOverviewMetadata": {
+            "type": "object",
+            "properties": {
+                "slots_per_epoch": {
+                    "type": "integer"
                 }
             }
         },
@@ -3309,6 +3776,55 @@ const docTemplate = `{
                 },
                 "status": {
                     "type": "string"
+                }
+            }
+        },
+        "api.APINetworkParticipation": {
+            "type": "object",
+            "properties": {
+                "complete": {
+                    "type": "boolean"
+                },
+                "expected_slots": {
+                    "type": "integer"
+                },
+                "indexed_slots": {
+                    "type": "integer"
+                },
+                "rate": {
+                    "type": "number"
+                },
+                "source": {
+                    "type": "string"
+                },
+                "warning": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.APINetworkRawAggregates": {
+            "type": "object",
+            "properties": {
+                "attestations_indexed": {
+                    "type": "integer"
+                },
+                "complete": {
+                    "type": "boolean"
+                },
+                "expected_slots": {
+                    "type": "integer"
+                },
+                "globalparticipationrate": {
+                    "type": "number"
+                },
+                "indexed_slots": {
+                    "type": "integer"
+                },
+                "source": {
+                    "type": "string"
+                },
+                "vote_participation": {
+                    "type": "number"
                 }
             }
         },
@@ -3485,6 +4001,208 @@ const docTemplate = `{
                 }
             }
         },
+        "api.APISlotBid": {
+            "type": "object",
+            "properties": {
+                "block_hash": {
+                    "type": "string"
+                },
+                "builder_index": {
+                    "type": "integer"
+                },
+                "builder_name": {
+                    "type": "string"
+                },
+                "el_payment": {
+                    "type": "integer"
+                },
+                "fee_recipient": {
+                    "type": "string"
+                },
+                "gas_limit": {
+                    "type": "integer"
+                },
+                "is_self_built": {
+                    "type": "boolean"
+                },
+                "is_winning": {
+                    "type": "boolean"
+                },
+                "parent_hash": {
+                    "type": "string"
+                },
+                "parent_root": {
+                    "type": "string"
+                },
+                "slot": {
+                    "type": "integer"
+                },
+                "total_value": {
+                    "type": "integer"
+                },
+                "value": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.APISlotBidsData": {
+            "type": "object",
+            "properties": {
+                "bids": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotBid"
+                    }
+                },
+                "block_root": {
+                    "type": "string"
+                },
+                "count": {
+                    "type": "integer"
+                },
+                "slot": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.APISlotBidsResponse": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "$ref": "#/definitions/api.APISlotBidsData"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.APISlotBlockAccessListBalance": {
+            "type": "object",
+            "properties": {
+                "balance": {
+                    "type": "string"
+                },
+                "block_access_index": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.APISlotBlockAccessListCode": {
+            "type": "object",
+            "properties": {
+                "block_access_index": {
+                    "type": "integer"
+                },
+                "code": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.APISlotBlockAccessListData": {
+            "type": "object",
+            "properties": {
+                "accesses": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotBlockAccessListEntry"
+                    }
+                },
+                "block_root": {
+                    "type": "string"
+                },
+                "count": {
+                    "type": "integer"
+                },
+                "slot": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.APISlotBlockAccessListEntry": {
+            "type": "object",
+            "properties": {
+                "address": {
+                    "type": "string"
+                },
+                "balance_changes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotBlockAccessListBalance"
+                    }
+                },
+                "code_changes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotBlockAccessListCode"
+                    }
+                },
+                "nonce_changes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotBlockAccessListNonce"
+                    }
+                },
+                "storage_changes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotBlockAccessListStorageGroup"
+                    }
+                },
+                "storage_reads": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "api.APISlotBlockAccessListNonce": {
+            "type": "object",
+            "properties": {
+                "block_access_index": {
+                    "type": "integer"
+                },
+                "nonce": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.APISlotBlockAccessListResponse": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "$ref": "#/definitions/api.APISlotBlockAccessListData"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.APISlotBlockAccessListStorage": {
+            "type": "object",
+            "properties": {
+                "block_access_index": {
+                    "type": "integer"
+                },
+                "value": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.APISlotBlockAccessListStorageGroup": {
+            "type": "object",
+            "properties": {
+                "changes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotBlockAccessListStorage"
+                    }
+                },
+                "slot": {
+                    "type": "string"
+                }
+            }
+        },
         "api.APISlotData": {
             "type": "object",
             "properties": {
@@ -3562,6 +4280,101 @@ const docTemplate = `{
                 },
                 "withdrawalcount": {
                     "type": "integer"
+                }
+            }
+        },
+        "api.APISlotInclusionList": {
+            "type": "object",
+            "properties": {
+                "inclusion_list_committee_root": {
+                    "type": "string"
+                },
+                "signature": {
+                    "type": "string"
+                },
+                "transactions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotInclusionListTransaction"
+                    }
+                },
+                "transactions_count": {
+                    "type": "integer"
+                },
+                "validator_index": {
+                    "type": "integer"
+                },
+                "validator_name": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.APISlotInclusionListTransaction": {
+            "type": "object",
+            "properties": {
+                "data_len": {
+                    "type": "integer"
+                },
+                "decode_error": {
+                    "type": "string"
+                },
+                "from": {
+                    "type": "string"
+                },
+                "gas_limit": {
+                    "type": "integer"
+                },
+                "hash": {
+                    "type": "string"
+                },
+                "index": {
+                    "type": "integer"
+                },
+                "is_included": {
+                    "type": "boolean"
+                },
+                "nonce": {
+                    "type": "integer"
+                },
+                "to": {
+                    "type": "string"
+                },
+                "type": {
+                    "type": "integer"
+                },
+                "value": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.APISlotInclusionListsData": {
+            "type": "object",
+            "properties": {
+                "block_root": {
+                    "type": "string"
+                },
+                "count": {
+                    "type": "integer"
+                },
+                "inclusion_lists": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotInclusionList"
+                    }
+                },
+                "slot": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.APISlotInclusionListsResponse": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "$ref": "#/definitions/api.APISlotInclusionListsData"
+                },
+                "status": {
+                    "type": "string"
                 }
             }
         },
@@ -3675,6 +4488,165 @@ const docTemplate = `{
                 }
             }
         },
+        "api.APISlotPayloadHeaderData": {
+            "type": "object",
+            "properties": {
+                "blob_kzg_commitments": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "block_hash": {
+                    "type": "string"
+                },
+                "block_root": {
+                    "type": "string"
+                },
+                "builder_index": {
+                    "type": "integer"
+                },
+                "builder_name": {
+                    "type": "string"
+                },
+                "gas_limit": {
+                    "type": "integer"
+                },
+                "has_payload_header": {
+                    "type": "boolean"
+                },
+                "is_self_built": {
+                    "type": "boolean"
+                },
+                "parent_block_hash": {
+                    "type": "string"
+                },
+                "parent_block_root": {
+                    "type": "string"
+                },
+                "payload_status": {
+                    "type": "integer"
+                },
+                "payload_status_name": {
+                    "type": "string"
+                },
+                "signature": {
+                    "type": "string"
+                },
+                "slot": {
+                    "type": "integer"
+                },
+                "value": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.APISlotPayloadHeaderResponse": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "$ref": "#/definitions/api.APISlotPayloadHeaderData"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.APISlotPtcAggregate": {
+            "type": "object",
+            "properties": {
+                "aggregation_bits": {
+                    "type": "string"
+                },
+                "blob_data_available": {
+                    "type": "boolean"
+                },
+                "payload_present": {
+                    "type": "boolean"
+                },
+                "signature": {
+                    "type": "string"
+                },
+                "validators": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotPtcValidator"
+                    }
+                },
+                "vote_count": {
+                    "type": "integer"
+                },
+                "vote_percent": {
+                    "type": "number"
+                }
+            }
+        },
+        "api.APISlotPtcValidator": {
+            "type": "object",
+            "properties": {
+                "index": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "api.APISlotPtcVotesData": {
+            "type": "object",
+            "properties": {
+                "aggregates": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotPtcAggregate"
+                    }
+                },
+                "block_root": {
+                    "type": "string"
+                },
+                "non_voter_count": {
+                    "type": "integer"
+                },
+                "non_voter_percent": {
+                    "type": "number"
+                },
+                "non_voters": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/api.APISlotPtcValidator"
+                    }
+                },
+                "participation": {
+                    "type": "number"
+                },
+                "slot": {
+                    "type": "integer"
+                },
+                "total_ptc_size": {
+                    "type": "integer"
+                },
+                "vote_count": {
+                    "type": "integer"
+                },
+                "voted_block_root": {
+                    "type": "string"
+                },
+                "voted_slot": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.APISlotPtcVotesResponse": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "$ref": "#/definitions/api.APISlotPtcVotesData"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
         "api.APISlotResponse": {
             "type": "object",
             "properties": {
@@ -3689,7 +4661,14 @@ const docTemplate = `{
         "api.APISlotsData": {
             "type": "object",
             "properties": {
+                "next_page": {
+                    "type": "integer"
+                },
                 "next_slot": {
+                    "description": "Use with max_slot for cursor-based pagination",
+                    "type": "integer"
+                },
+                "page": {
                     "type": "integer"
                 },
                 "slots": {

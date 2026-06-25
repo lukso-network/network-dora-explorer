@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/utils"
-	dasguardian "github.com/probe-lab/eth-das-guardian"
+	dasguardian "github.com/ethpandaops/eth-das-guardian"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -141,7 +141,7 @@ func APIDasGuardianMassScan(w http.ResponseWriter, r *http.Request) {
 
 		// Select random slots once for all nodes to ensure comparability
 		var err error
-		selectedSlots, err = selectRandomSlotsForMassScan(req.RandomMode, int(randomCount))
+		selectedSlots, err = selectRandomSlotsForMassScan(r.Context(), req.RandomMode, int(randomCount))
 		if err != nil {
 			logrus.WithError(err).Error("failed to select random slots for mass scan")
 			http.Error(w, `{"error": "failed to select random slots"}`, http.StatusInternalServerError)
@@ -291,7 +291,7 @@ func APIDasGuardianMassScan(w http.ResponseWriter, r *http.Request) {
 }
 
 // selectRandomSlotsForMassScan selects random slots for mass scanning (same slots for all nodes)
-func selectRandomSlotsForMassScan(mode string, count int) ([]uint64, error) {
+func selectRandomSlotsForMassScan(ctx context.Context, mode string, count int) ([]uint64, error) {
 	chainState := services.GlobalBeaconService.GetChainState()
 	currentSlot := uint64(chainState.CurrentSlot())
 
@@ -351,7 +351,7 @@ func selectRandomSlotsForMassScan(mode string, count int) ([]uint64, error) {
 			WithMissing:  1,
 		}
 
-		blocks := services.GlobalBeaconService.GetDbBlocksByFilter(filter, 0, 1, 0)
+		blocks := services.GlobalBeaconService.GetDbBlocksByFilter(ctx, filter, 0, 1, 0)
 
 		// Check conditions based on mode
 		switch mode {

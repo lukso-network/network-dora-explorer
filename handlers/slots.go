@@ -2,15 +2,15 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/indexer/beacon"
@@ -18,6 +18,7 @@ import (
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
 	"github.com/ethpandaops/dora/utils"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -40,9 +41,9 @@ func Slots(w http.ResponseWriter, r *http.Request) {
 	if urlArgs.Has("s") {
 		firstSlot, _ = strconv.ParseUint(urlArgs.Get("s"), 10, 64)
 	}
-	var displayColumns string = ""
+	var displayColumns uint64 = 0
 	if urlArgs.Has("d") {
-		displayColumns = urlArgs.Get("d")
+		displayColumns = utils.DecodeUint64BitfieldFromQuery(r.URL.RawQuery, "d")
 	}
 
 	var pageError error
@@ -60,11 +61,11 @@ func Slots(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func getSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string) (*models.SlotsPageData, error) {
+func getSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns uint64) (*models.SlotsPageData, error) {
 	pageData := &models.SlotsPageData{}
 	pageCacheKey := fmt.Sprintf("slots:%v:%v:%v", firstSlot, pageSize, displayColumns)
 	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
-		pageData, cacheTimeout := buildSlotsPageData(firstSlot, pageSize, displayColumns)
+		pageData, cacheTimeout := buildSlotsPageData(pageCall.CallCtx, firstSlot, pageSize, displayColumns)
 		pageCall.CacheTimeout = cacheTimeout
 		return pageData
 	})
@@ -78,20 +79,17 @@ func getSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string) 
 	return pageData, pageErr
 }
 
-func buildSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string) (*models.SlotsPageData, time.Duration) {
+func buildSlotsPageData(ctx context.Context, firstSlot uint64, pageSize uint64, displayColumns uint64) (*models.SlotsPageData, time.Duration) {
 	logrus.Debugf("slots page called: %v:%v", firstSlot, pageSize)
 	pageData := &models.SlotsPageData{}
 
 	// Set display columns based on the parameter
 	displayMap := map[uint64]bool{}
-	displayList := []string{}
-	if displayColumns != "" {
-		for _, col := range strings.Split(displayColumns, " ") {
-			colNum, err := strconv.ParseUint(col, 10, 64)
-			if err != nil {
-				continue
+	if displayColumns != 0 {
+		for i := 0; i < 64; i++ {
+			if displayColumns&(1<<i) != 0 {
+				displayMap[uint64(i+1)] = true
 			}
-			displayMap[colNum] = true
 		}
 	}
 	if len(displayMap) == 0 {
@@ -121,11 +119,20 @@ func buildSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string
 			17: false,
 			18: !hasSnooperClients, // Disable receive delay if snooper clients exist
 			19: hasSnooperClients,  // Enable exec time if snooper clients exist
+			20: false,              // Builder (opt-in; proposer column already shows build source)
 		}
-	} else {
-		for col := range displayMap {
-			displayList = append(displayList, fmt.Sprintf("%v", col))
+	}
+
+	displayMask := uint64(0)
+	for col := range displayMap {
+		if col == 0 || col > 64 {
+			continue
 		}
+		displayMask |= 1 << (col - 1)
+	}
+	displayColumnsParam := ""
+	if displayColumns != 0 {
+		displayColumnsParam = fmt.Sprintf("&d=0x%x", displayMask)
 	}
 
 	pageData.DisplayChain = displayMap[1]
@@ -147,26 +154,13 @@ func buildSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string
 	pageData.DisplayBlockSize = displayMap[17]
 	pageData.DisplayRecvDelay = displayMap[18]
 	pageData.DisplayExecTime = displayMap[19]
+	pageData.DisplayBuilder = displayMap[20]
 	pageData.DisplayColCount = uint64(len(displayMap))
-
-	// Build column selection URL parameter if not default
-	displayColumnsParam := ""
-	if len(displayList) > 0 {
-		sort.Slice(displayList, func(a, b int) bool {
-			colA, _ := strconv.ParseUint(displayList[a], 10, 64)
-			colB, _ := strconv.ParseUint(displayList[b], 10, 64)
-			return colA < colB
-		})
-		displayColumnsParam = "&d=" + strings.Join(displayList, "+")
-	}
 
 	chainState := services.GlobalBeaconService.GetChainState()
 	currentSlot := chainState.CurrentSlot()
 	currentEpoch := chainState.EpochOfSlot(currentSlot)
 	maxSlot := currentSlot + 8
-	if maxSlot >= chainState.EpochToSlot(currentEpoch+1) {
-		maxSlot = chainState.EpochToSlot(currentEpoch+1) - 1
-	}
 	if firstSlot > uint64(maxSlot) {
 		pageData.IsDefaultPage = true
 		firstSlot = uint64(maxSlot)
@@ -196,10 +190,10 @@ func buildSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string
 	pageData.LastPageSlot = pageSize - 1
 
 	// Populate UrlParams for page jump functionality
-	pageData.UrlParams = make(map[string]string)
-	pageData.UrlParams["c"] = fmt.Sprintf("%v", pageData.PageSize)
-	if len(displayList) > 0 {
-		pageData.UrlParams["d"] = strings.Join(displayList, "+")
+	pageData.UrlParams = make([]models.UrlParam, 0)
+	pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{Key: "c", Value: fmt.Sprintf("%v", pageData.PageSize)})
+	if displayColumns != 0 {
+		pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{Key: "d", Value: fmt.Sprintf("0x%x", displayMask)})
 	}
 	pageData.MaxSlot = uint64(maxSlot)
 
@@ -223,7 +217,7 @@ func buildSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string
 
 	// load slots
 	pageData.Slots = make([]*models.SlotsPageDataSlot, 0)
-	dbSlots := services.GlobalBeaconService.GetDbBlocksForSlots(firstSlot, uint32(pageSize), true, true)
+	dbSlots := services.GlobalBeaconService.GetDbBlocksForSlots(ctx, firstSlot, uint32(pageSize), true, true)
 	dbIdx := 0
 	dbCnt := len(dbSlots)
 	blockCount := uint64(0)
@@ -245,7 +239,7 @@ func buildSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string
 		}
 
 		if len(execBlockHashes) > 0 {
-			mevBlocksMap = db.GetMevBlocksByBlockHashes(execBlockHashes)
+			mevBlocksMap = db.GetMevBlocksByBlockHashes(ctx, execBlockHashes)
 		}
 	}
 
@@ -260,12 +254,19 @@ func buildSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string
 			dbSlot := dbSlots[dbIdx]
 			dbIdx++
 
+			epoch := chainState.EpochOfSlot(phase0.Slot(slot))
+			payloadStatus := dbSlot.PayloadStatus
+			if !chainState.IsEip7732Enabled(phase0.Epoch(epoch)) {
+				payloadStatus = dbtypes.PayloadStatusCanonical
+			}
+
 			slotData := &models.SlotsPageDataSlot{
 				Slot:                  slot,
-				Epoch:                 uint64(chainState.EpochOfSlot(phase0.Slot(slot))),
+				Epoch:                 uint64(epoch),
 				Ts:                    chainState.SlotToTime(phase0.Slot(slot)),
 				Finalized:             finalized,
 				Status:                uint8(dbSlot.Status),
+				PayloadStatus:         uint8(payloadStatus),
 				Scheduled:             slot >= uint64(currentSlot) && dbSlot.Status == dbtypes.Missing,
 				Synchronized:          dbSlot.SyncParticipation != -1,
 				Proposer:              dbSlot.Proposer,
@@ -305,6 +306,21 @@ func buildSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string
 						}
 					}
 					slotData.MevBlockRelays = strings.Join(relays, ", ")
+				}
+			}
+
+			// Add builder info (needed for the Builder column and the proposer build-source icon).
+			// Only blocks that actually exist (proposed or orphaned) carry a build source;
+			// scheduled/missing slots have no payload yet.
+			if (pageData.DisplayBuilder || pageData.DisplayProposer) && dbSlot.Status > 0 {
+				if dbSlot.BuilderIndex == -1 {
+					slotData.HasBuilder = true
+					slotData.BuilderIndex = math.MaxUint64
+				} else if dbSlot.BuilderIndex >= 0 {
+					slotData.HasBuilder = true
+					slotData.BuilderIndex = uint64(dbSlot.BuilderIndex)
+					slotData.BuilderName = services.GlobalBeaconService.GetValidatorName(uint64(dbSlot.BuilderIndex) | services.BuilderIndexFlag)
+					slotData.BuilderURL = services.GlobalBeaconService.GetBuilderURL(uint64(dbSlot.BuilderIndex))
 				}
 			}
 
@@ -348,13 +364,13 @@ func buildSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string
 
 			pageData.Slots = append(pageData.Slots, slotData)
 			blockCount++
-			buildSlotsPageSlotGraph(pageData, slotData, &maxOpenFork, openForks, isFirstPage)
+			buildSlotsPageSlotGraph(ctx, pageData, slotData, &maxOpenFork, openForks, isFirstPage)
 		}
 	}
 	pageData.SlotCount = uint64(blockCount)
 	pageData.FirstSlot = firstSlot
 	pageData.LastSlot = lastSlot
-	pageData.ForkTreeWidth = (maxOpenFork * 20) + 20
+	pageData.ForkTreeWidth = int32((maxOpenFork * 20) + 20)
 
 	var cacheTimeout time.Duration
 
@@ -370,7 +386,7 @@ func buildSlotsPageData(firstSlot uint64, pageSize uint64, displayColumns string
 	return pageData, cacheTimeout
 }
 
-func buildSlotsPageSlotGraph(pageData *models.SlotsPageData, slotData *models.SlotsPageDataSlot, maxOpenFork *int, openForks map[int][]byte, isFirstPage bool) {
+func buildSlotsPageSlotGraph(ctx context.Context, pageData *models.SlotsPageData, slotData *models.SlotsPageDataSlot, maxOpenFork *int, openForks map[int][]byte, isFirstPage bool) {
 	// fork tree
 	var forkGraphIdx int = -1
 	var freeForkIdx int = -1
@@ -382,15 +398,22 @@ func buildSlotsPageSlotGraph(pageData *models.SlotsPageData, slotData *models.Sl
 		} else {
 			for graphCount <= forkIdx {
 				forkGraph = &models.SlotsPageDataForkGraph{
-					Index: graphCount,
-					Left:  10 + (graphCount * 20),
-					Tiles: map[string]bool{},
+					Index: int32(graphCount),
+					Left:  int32(10 + (graphCount * 20)),
+					Tiles: make([]string, 0),
 				}
 				slotData.ForkGraph = append(slotData.ForkGraph, forkGraph)
 				graphCount++
 			}
 		}
 		return forkGraph
+	}
+
+	addTile := func(forkGraph *models.SlotsPageDataForkGraph, tile string) {
+		if slices.Contains(forkGraph.Tiles, tile) {
+			return
+		}
+		forkGraph.Tiles = append(forkGraph.Tiles, tile)
 	}
 
 	for forkIdx := 0; forkIdx < *maxOpenFork; forkIdx++ {
@@ -401,7 +424,7 @@ func buildSlotsPageSlotGraph(pageData *models.SlotsPageData, slotData *models.Sl
 			}
 			continue
 		} else {
-			forkGraph.Tiles["vline"] = true
+			addTile(forkGraph, "vline")
 			if bytes.Equal(openForks[forkIdx], slotData.BlockRoot) {
 				if forkGraphIdx != -1 {
 					continue
@@ -416,14 +439,14 @@ func buildSlotsPageSlotGraph(pageData *models.SlotsPageData, slotData *models.Sl
 					for idx := forkIdx + 1; idx <= targetIdx; idx++ {
 						splitGraph := getForkGraph(slotData, idx)
 						if idx == targetIdx {
-							splitGraph.Tiles["tline"] = true
-							splitGraph.Tiles["lline"] = true
-							splitGraph.Tiles["fork"] = true
+							addTile(splitGraph, "tline")
+							addTile(splitGraph, "lline")
+							addTile(splitGraph, "fork")
 						} else {
-							splitGraph.Tiles["hline"] = true
+							addTile(splitGraph, "hline")
 						}
 					}
-					forkGraph.Tiles["rline"] = true
+					addTile(forkGraph, "rline")
 					openForks[targetIdx] = nil
 				}
 			}
@@ -435,7 +458,7 @@ func buildSlotsPageSlotGraph(pageData *models.SlotsPageData, slotData *models.Sl
 		hasForks := false
 		if !isFirstPage {
 			// get blocks that build on top of this
-			refBlocks := services.GlobalBeaconService.GetDbBlocksByParentRoot(phase0.Root(slotData.BlockRoot))
+			refBlocks := services.GlobalBeaconService.GetDbBlocksByParentRoot(ctx, phase0.Root(slotData.BlockRoot))
 			refBlockCount := len(refBlocks)
 			if refBlockCount > 0 {
 				freeForkIdx = *maxOpenFork
@@ -448,11 +471,11 @@ func buildSlotsPageSlotGraph(pageData *models.SlotsPageData, slotData *models.Sl
 						graphIdx := *maxOpenFork
 						*maxOpenFork++
 						splitGraph := getForkGraph(slotData, graphIdx)
-						splitGraph.Tiles["tline"] = true
-						splitGraph.Tiles["lline"] = true
-						splitGraph.Tiles["fork"] = true
+						addTile(splitGraph, "tline")
+						addTile(splitGraph, "lline")
+						addTile(splitGraph, "fork")
 						if idx < refBlockCount-1 {
-							splitGraph.Tiles["hline"] = true
+							addTile(splitGraph, "hline")
 						}
 					}
 				}
@@ -464,7 +487,7 @@ func buildSlotsPageSlotGraph(pageData *models.SlotsPageData, slotData *models.Sl
 					}
 					for idx := 0; idx < refBlockCount; idx++ {
 						splitGraph := getForkGraph(slot, freeForkIdx+idx)
-						splitGraph.Tiles["vline"] = true
+						addTile(splitGraph, "vline")
 					}
 				}
 			}
@@ -478,12 +501,12 @@ func buildSlotsPageSlotGraph(pageData *models.SlotsPageData, slotData *models.Sl
 		forkGraph := getForkGraph(slotData, freeForkIdx)
 		forkGraph.Block = true
 		if hasHead {
-			forkGraph.Tiles["vline"] = true
+			addTile(forkGraph, "vline")
 			if hasForks {
-				forkGraph.Tiles["rline"] = true
+				addTile(forkGraph, "rline")
 			}
 		} else {
-			forkGraph.Tiles["bline"] = true
+			addTile(forkGraph, "bline")
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -8,14 +9,15 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethpandaops/dora/db"
 	"github.com/ethpandaops/dora/dbtypes"
 	"github.com/ethpandaops/dora/services"
 	"github.com/ethpandaops/dora/templates"
 	"github.com/ethpandaops/dora/types/models"
+	v1 "github.com/ethpandaops/go-eth2-client/api/v1"
+	"github.com/ethpandaops/go-eth2-client/spec/gloas"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 )
 
@@ -94,8 +96,10 @@ func InitiatedDeposits(w http.ResponseWriter, r *http.Request) {
 func getFilteredInitiatedDepositsPageData(pageIdx uint64, pageSize uint64, address string, publickey string, vname string, minAmount uint64, maxAmount uint64, withOrphaned uint8, withValid uint8) (*models.InitiatedDepositsPageData, error) {
 	pageData := &models.InitiatedDepositsPageData{}
 	pageCacheKey := fmt.Sprintf("initiated_deposits:%v:%v:%v:%v:%v:%v:%v:%v:%v", pageIdx, pageSize, address, publickey, vname, minAmount, maxAmount, withOrphaned, withValid)
-	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(_ *services.FrontendCacheProcessingPage) interface{} {
-		return buildFilteredInitiatedDepositsPageData(pageIdx, pageSize, address, publickey, vname, minAmount, maxAmount, withOrphaned, withValid)
+	pageRes, pageErr := services.GlobalFrontendCache.ProcessCachedPage(pageCacheKey, true, pageData, func(pageCall *services.FrontendCacheProcessingPage) interface{} {
+		pageData, cacheTimeout := buildFilteredInitiatedDepositsPageData(pageCall.CallCtx, pageIdx, pageSize, address, publickey, vname, minAmount, maxAmount, withOrphaned, withValid)
+		pageCall.CacheTimeout = cacheTimeout
+		return pageData
 	})
 	if pageErr == nil && pageRes != nil {
 		resData, resOk := pageRes.(*models.InitiatedDepositsPageData)
@@ -107,7 +111,7 @@ func getFilteredInitiatedDepositsPageData(pageIdx uint64, pageSize uint64, addre
 	return pageData, pageErr
 }
 
-func buildFilteredInitiatedDepositsPageData(pageIdx uint64, pageSize uint64, address string, publickey string, vname string, minAmount uint64, maxAmount uint64, withOrphaned uint8, withValid uint8) *models.InitiatedDepositsPageData {
+func buildFilteredInitiatedDepositsPageData(ctx context.Context, pageIdx uint64, pageSize uint64, address string, publickey string, vname string, minAmount uint64, maxAmount uint64, withOrphaned uint8, withValid uint8) (*models.InitiatedDepositsPageData, time.Duration) {
 	filterArgs := url.Values{}
 	if address != "" {
 		filterArgs.Add("f.address", address)
@@ -140,9 +144,12 @@ func buildFilteredInitiatedDepositsPageData(pageIdx uint64, pageSize uint64, add
 		FilterWithOrphaned:  withOrphaned,
 		FilterWithValid:     withValid,
 	}
+	cacheTimeout := 5 * time.Minute
 	logrus.Debugf("initiated_deposits page called: %v:%v [%v,%v,%v,%v,%v]", pageIdx, pageSize, address, publickey, vname, minAmount, maxAmount)
 	if pageIdx == 1 {
 		pageData.IsDefaultPage = true
+	} else {
+		cacheTimeout = 15 * time.Minute
 	}
 
 	if pageSize > 100 {
@@ -169,12 +176,14 @@ func buildFilteredInitiatedDepositsPageData(pageIdx uint64, pageSize uint64, add
 	offset := (pageIdx - 1) * pageSize
 	canonicalForkIds := services.GlobalBeaconService.GetCanonicalForkIds()
 
-	dbDepositTxs, totalRows, err := db.GetDepositTxsFiltered(offset, uint32(pageSize), canonicalForkIds, depositFilter)
+	dbDepositTxs, totalRows, err := db.GetDepositTxsFiltered(ctx, offset, uint32(pageSize), canonicalForkIds, depositFilter)
 	if err != nil {
 		panic(err)
 	}
 
 	for _, depositTx := range dbDepositTxs {
+		isBuilder := len(depositTx.WithdrawalCredentials) > 0 && depositTx.WithdrawalCredentials[0] == 0x03
+
 		depositTxData := &models.InitiatedDepositsPageDataDeposit{
 			Index:                 depositTx.Index,
 			Address:               depositTx.TxSender,
@@ -187,18 +196,38 @@ func buildFilteredInitiatedDepositsPageData(pageIdx uint64, pageSize uint64, add
 			Orphaned:              depositTx.Orphaned,
 			Valid:                 depositTx.ValidSignature == 1 || depositTx.ValidSignature == 2,
 			ValidatorStatus:       "",
+			IsBuilder:             isBuilder,
 		}
 
 		if validatorIdx, found := services.GlobalBeaconService.GetValidatorIndexByPubkey(phase0.BLSPubKey(depositTx.PublicKey)); !found {
 			depositTxData.ValidatorStatus = "Deposited"
 			depositTxData.ValidatorExists = false
+		} else if uint64(validatorIdx)&services.BuilderIndexFlag != 0 {
+			builderIndex := uint64(validatorIdx) &^ services.BuilderIndexFlag
+			depositTxData.IsBuilder = true
+			depositTxData.ValidatorExists = true
+			depositTxData.ValidatorIndex = builderIndex
+			depositTxData.ValidatorName = services.GlobalBeaconService.GetValidatorName(uint64(validatorIdx))
+
+			builder := services.GlobalBeaconService.GetBuilderByIndex(gloas.BuilderIndex(builderIndex))
+			if builder == nil {
+				depositTxData.ValidatorStatus = "Deposited"
+			} else if builder.WithdrawableEpoch <= services.GlobalBeaconService.GetChainState().CurrentEpoch() {
+				depositTxData.ValidatorStatus = "Exited"
+			} else {
+				depositTxData.ValidatorStatus = "Active"
+			}
 		} else {
 			depositTxData.ValidatorExists = true
 			depositTxData.ValidatorIndex = uint64(validatorIdx)
+			depositTxData.ProjectedIndex = services.GlobalBeaconService.IsProjectedValidatorIndex(validatorIdx)
+			depositTxData.IsBuilder = false
 			depositTxData.ValidatorName = services.GlobalBeaconService.GetValidatorName(uint64(validatorIdx))
 
 			validator := services.GlobalBeaconService.GetValidatorByIndex(validatorIdx, false)
-			if strings.HasPrefix(validator.Status.String(), "pending") {
+			if validator == nil {
+				depositTxData.ValidatorStatus = "Deposited"
+			} else if strings.HasPrefix(validator.Status.String(), "pending") {
 				depositTxData.ValidatorStatus = "Pending"
 			} else if validator.Status == v1.ValidatorStateActiveOngoing {
 				depositTxData.ValidatorStatus = "Active"
@@ -242,18 +271,18 @@ func buildFilteredInitiatedDepositsPageData(pageIdx uint64, pageSize uint64, add
 	}
 
 	// Populate UrlParams for page jump functionality
-	pageData.UrlParams = make(map[string]string)
+	pageData.UrlParams = make([]models.UrlParam, 0)
 	for key, values := range filterArgs {
 		if len(values) > 0 {
-			pageData.UrlParams[key] = values[0]
+			pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{Key: key, Value: values[0]})
 		}
 	}
-	pageData.UrlParams["c"] = fmt.Sprintf("%v", pageData.PageSize)
+	pageData.UrlParams = append(pageData.UrlParams, models.UrlParam{Key: "c", Value: fmt.Sprintf("%v", pageData.PageSize)})
 
 	pageData.FirstPageLink = fmt.Sprintf("/validators/initiated_deposits?f&%v&c=%v", filterArgs.Encode(), pageData.PageSize)
 	pageData.PrevPageLink = fmt.Sprintf("/validators/initiated_deposits?f&%v&c=%v&p=%v", filterArgs.Encode(), pageData.PageSize, pageData.PrevPageIndex)
 	pageData.NextPageLink = fmt.Sprintf("/validators/initiated_deposits?f&%v&c=%v&p=%v", filterArgs.Encode(), pageData.PageSize, pageData.NextPageIndex)
 	pageData.LastPageLink = fmt.Sprintf("/validators/initiated_deposits?f&%v&c=%v&p=%v", filterArgs.Encode(), pageData.PageSize, pageData.LastPageIndex)
 
-	return pageData
+	return pageData, cacheTimeout
 }

@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"syscall"
@@ -43,26 +44,28 @@ func InitPageData(w http.ResponseWriter, r *http.Request, active, path, title st
 			Path:        path,
 			Templates:   strings.Join(mainTemplates, ","),
 		},
-		Active:           active,
-		Data:             &types.Empty{},
-		Version:          utils.GetExplorerVersion(),
-		BuildTime:        fmt.Sprintf("%v", buildTime.Unix()),
-		Year:             time.Now().UTC().Year(),
-		ExplorerTitle:    utils.Config.Frontend.SiteName,
-		ExplorerSubtitle: utils.Config.Frontend.SiteSubtitle,
-		ExplorerLogo:     utils.Config.Frontend.SiteLogo,
-		TokenSymbol:      utils.Config.Chain.TokenSymbol,
-		Lang:             "en-US",
-		Debug:            utils.Config.Frontend.Debug,
-		MainMenuItems:    createMenuItems(active),
-		ApiEnabled:       utils.Config.Api.Enabled && !utils.Config.Api.RequireAuth,
+		Active:                  active,
+		Data:                    &types.Empty{},
+		Version:                 utils.GetExplorerVersion(),
+		BuildTime:               fmt.Sprintf("%v", buildTime.Unix()),
+		ServerTime:              time.Now().UnixMilli(),
+		Year:                    time.Now().UTC().Year(),
+		ExplorerTitle:           utils.Config.Frontend.SiteName,
+		ExplorerSubtitle:        utils.Config.Frontend.SiteSubtitle,
+		ExplorerLogo:            utils.Config.Frontend.SiteLogo,
+		TokenSymbol:             utils.Config.Chain.TokenSymbol,
+		Lang:                    "en-US",
+		Debug:                   utils.Config.Frontend.Debug,
+		MainMenuItems:           createMenuItems(active),
+		ApiEnabled:              utils.Config.Api.Enabled && !utils.Config.Api.RequireAuth,
+		ExecutionIndexerEnabled: utils.Config.ExecutionIndexer.Enabled,
 	}
 
 	chainState := services.GlobalBeaconService.GetChainState()
 	if specs := chainState.GetSpecs(); specs != nil {
 		data.IsReady = true
 		data.ChainSlotsPerEpoch = specs.SlotsPerEpoch
-		data.ChainSecondsPerSlot = uint64(specs.SecondsPerSlot)
+		data.ChainSlotDurationMs = specs.SlotDurationMs
 		data.ChainGenesisTimestamp = uint64(chainState.GetGenesis().GenesisTime.Unix())
 		data.DepositContract = common.BytesToAddress(specs.DepositContractAddress).String()
 		data.Mainnet = specs.ConfigName == "mainnet"
@@ -90,6 +93,8 @@ func InitPageData(w http.ResponseWriter, r *http.Request, active, path, title st
 }
 
 func createMenuItems(active string) []types.MainMenuItem {
+	chainState := services.GlobalBeaconService.GetChainState()
+	specs := chainState.GetSpecs()
 	hiddenFor := []string{"confirmation", "login", "register"}
 
 	if utils.SliceContains(hiddenFor, active) {
@@ -125,6 +130,11 @@ func createMenuItems(active string) []types.MainMenuItem {
 				Label: "Blocks",
 				Path:  "/blocks",
 				Icon:  "fa-cube",
+			},
+			{
+				Label: "Blobs",
+				Path:  "/blobs",
+				Icon:  "fa-database",
 			},
 			/*
 				{
@@ -203,7 +213,8 @@ func createMenuItems(active string) []types.MainMenuItem {
 	validatorMenu = append(validatorMenu, types.NavigationGroup{
 		Links: validatorMenuLinks,
 	})
-	validatorMenu = append(validatorMenu, types.NavigationGroup{
+
+	validatorActionsGroup := types.NavigationGroup{
 		Links: []types.NavigationLink{
 			{
 				Label: "Deposits",
@@ -211,36 +222,39 @@ func createMenuItems(active string) []types.MainMenuItem {
 				Icon:  "fa-file-signature",
 			},
 			{
-				Label: "Exits",
-				Path:  "/validators/exits",
-				Icon:  "fa-door-open",
-			},
-			{
-				Label: "Slashings",
-				Path:  "/validators/slashings",
-				Icon:  "fa-user-slash",
+				Label: "Withdrawals",
+				Path:  "/validators/withdrawals",
+				Icon:  "fa-money-bill-transfer",
 			},
 		},
-	})
-
-	chainState := services.GlobalBeaconService.GetChainState()
-	specs := chainState.GetSpecs()
-	if specs != nil && specs.ElectraForkEpoch != nil && uint64(chainState.CurrentEpoch()) >= *specs.ElectraForkEpoch {
-		validatorMenu = append(validatorMenu, types.NavigationGroup{
-			Links: []types.NavigationLink{
-				{
-					Label: "Withdrawal Requests",
-					Path:  "/validators/withdrawals",
-					Icon:  "fa-money-bill-transfer",
-				},
-				{
-					Label: "Consolidation Requests",
-					Path:  "/validators/consolidations",
-					Icon:  "fa-square-plus",
-				},
-			},
-		})
 	}
+
+	if specs != nil && specs.ElectraForkEpoch != nil && uint64(chainState.CurrentEpoch()) >= *specs.ElectraForkEpoch {
+		validatorActionsGroup.Links = append(
+			validatorActionsGroup.Links,
+			types.NavigationLink{
+				Label: "Consolidations",
+				Path:  "/validators/consolidations",
+				Icon:  "fa-square-plus",
+			},
+		)
+	}
+
+	validatorActionsGroup.Links = append(
+		validatorActionsGroup.Links,
+		types.NavigationLink{
+			Label: "Exits",
+			Path:  "/validators/exits",
+			Icon:  "fa-door-open",
+		},
+		types.NavigationLink{
+			Label: "Slashings",
+			Path:  "/validators/slashings",
+			Icon:  "fa-user-slash",
+		},
+	)
+
+	validatorMenu = append(validatorMenu, validatorActionsGroup)
 
 	submitLinks := []types.NavigationLink{}
 	if utils.Config.Frontend.ShowSubmitDeposit {
@@ -270,7 +284,7 @@ func createMenuItems(active string) []types.MainMenuItem {
 		})
 	}
 
-	return []types.MainMenuItem{
+	mainMenu := []types.MainMenuItem{
 		{
 			Label:    "Blockchain",
 			IsActive: active == "blockchain",
@@ -281,12 +295,69 @@ func createMenuItems(active string) []types.MainMenuItem {
 			IsActive: active == "validators",
 			Groups:   validatorMenu,
 		},
-		{
-			Label:    "Clients",
-			IsActive: active == "clients",
-			Groups:   clientsMenu,
-		},
 	}
+
+	// Builders menu group (Gloas/EIP-8282): builders are tracked separately from validators.
+	// Shown as soon as Gloas is scheduled (a finite fork epoch), not only once it is active, so
+	// the builder deposits page can surface the projected early-onboarded builders ahead of the fork.
+	if specs != nil && specs.GloasForkEpoch != nil && *specs.GloasForkEpoch < math.MaxUint64 {
+		buildersMenu := []types.NavigationGroup{
+			{
+				Links: []types.NavigationLink{
+					{
+						Label: "Builders",
+						Path:  "/builders",
+						Icon:  "fa-building",
+					},
+					{
+						Label: "Deposits",
+						Path:  "/builders/deposits",
+						Icon:  "fa-file-signature",
+					},
+					{
+						Label: "Exits",
+						Path:  "/builders/exits",
+						Icon:  "fa-door-open",
+					},
+				},
+			},
+		}
+
+		builderSubmitLinks := []types.NavigationLink{}
+		if utils.Config.Frontend.ShowSubmitDeposit {
+			builderSubmitLinks = append(builderSubmitLinks, types.NavigationLink{
+				Label: "Submit Deposit",
+				Path:  "/builders/submit_deposit",
+				Icon:  "fa-file-import",
+			})
+		}
+		if utils.Config.Frontend.ShowSubmitElRequests {
+			builderSubmitLinks = append(builderSubmitLinks, types.NavigationLink{
+				Label: "Submit Exit",
+				Path:  "/builders/submit_exit",
+				Icon:  "fa-door-open",
+			})
+		}
+		if len(builderSubmitLinks) > 0 {
+			buildersMenu = append(buildersMenu, types.NavigationGroup{
+				Links: builderSubmitLinks,
+			})
+		}
+
+		mainMenu = append(mainMenu, types.MainMenuItem{
+			Label:    "Builders",
+			IsActive: active == "builders",
+			Groups:   buildersMenu,
+		})
+	}
+
+	mainMenu = append(mainMenu, types.MainMenuItem{
+		Label:    "Clients",
+		IsActive: active == "clients",
+		Groups:   clientsMenu,
+	})
+
+	return mainMenu
 }
 
 // used to handle errors constructed by Template.ExecuteTemplate correctly
