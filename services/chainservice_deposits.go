@@ -861,13 +861,11 @@ func (bs *ChainService) getRecentIncludedDeposits(ctx context.Context, headRoot 
 
 	if lastQueued == nil {
 		// no included deposit in cache, fall back to the last canonical one in the db
-		dbDeposits, _, err := db.GetDepositsFiltered(ctx, 0, 1, canonicalForkIdsUint64, &dbtypes.DepositFilter{
-			WithOrphaned: 0,
-		}, nil)
+		dbDeposit, err := db.GetLatestCanonicalDeposit(ctx, canonicalForkIdsUint64)
 		if err != nil {
 			logrus.Warnf("ChainService.getRecentIncludedDeposits error: %v", err)
-		} else if len(dbDeposits) > 0 {
-			lastQueued = &dbDeposits[0].Deposit
+		} else if dbDeposit != nil {
+			lastQueued = dbDeposit
 		}
 	}
 
