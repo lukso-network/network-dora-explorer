@@ -105,6 +105,35 @@ func GetDepositRequestsBySlots(ctx context.Context, slots []uint64, canonicalFor
 	return deposits, nil
 }
 
+// GetLatestCanonicalDeposit returns the most recently included deposit on the canonical chain.
+// Deliberately not GetDepositsFiltered: that materializes and count(*)s every matching row
+// (~500ms on 170k deposits) just to return one. The NULLS LAST on slot_number lets the planner
+// walk deposits_slot_number_idx backwards and stop at the first row (<1ms).
+func GetLatestCanonicalDeposit(ctx context.Context, canonicalForkIds []uint64) (*dbtypes.Deposit, error) {
+	var sql strings.Builder
+	args := []any{}
+	fmt.Fprint(&sql, `
+	SELECT
+		deposit_index, slot_number, slot_index, slot_root, orphaned, publickey, withdrawalcredentials, amount, fork_id
+	FROM deposits
+	`)
+	filterOp := "WHERE"
+	appendWithOrphanedFilter(&sql, &args, &filterOp, 0, canonicalForkIds, "fork_id")
+	fmt.Fprint(&sql, `
+	ORDER BY slot_number DESC NULLS LAST, deposit_index DESC
+	LIMIT 1
+	`)
+
+	deposits := []*dbtypes.Deposit{}
+	if err := ReaderDb.SelectContext(ctx, &deposits, sql.String(), args...); err != nil {
+		return nil, fmt.Errorf("error fetching latest canonical deposit: %w", err)
+	}
+	if len(deposits) == 0 {
+		return nil, nil
+	}
+	return deposits[0], nil
+}
+
 func GetDepositsFiltered(ctx context.Context, offset uint64, limit uint32, canonicalForkIds []uint64, filter *dbtypes.DepositFilter, txFilter *dbtypes.DepositTxFilter) ([]*dbtypes.DepositWithTx, uint64, error) {
 	var sql strings.Builder
 	args := []any{}
