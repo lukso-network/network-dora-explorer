@@ -82,7 +82,68 @@ func GetWithdrawalsByBlockUid(ctx context.Context, blockUid uint64) ([]*dbtypes.
 	return withdrawals, nil
 }
 
+// withdrawalsFilterIsRecentOnly reports whether filter selects nothing but "latest withdrawals"
+// (optionally canonical only), i.e. the /withdrawals overview and unfiltered list pages.
+func withdrawalsFilterIsRecentOnly(filter *dbtypes.WithdrawalFilter) bool {
+	return filter.MinIndex == 0 && filter.MaxIndex == 0 && filter.ValidatorName == "" &&
+		filter.AccountID == nil && len(filter.Types) == 0 && filter.MinAmount == nil &&
+		filter.MaxAmount == nil && filter.WithOrphaned != 2
+}
+
+// getRecentWithdrawals serves the unfiltered pages. GetWithdrawalsFiltered's count-the-whole-CTE
+// shape costs ~5s on 2.7M rows just to return 20 of them; walking withdrawals_block_uid_idx
+// backwards is <1ms, and the pagination total comes from table statistics (pg_class.reltuples,
+// within ~0.2% of exact) instead of a full count.
+func getRecentWithdrawals(ctx context.Context, offset uint64, limit uint32, finalizedBlock uint64, canonicalOnly bool) ([]*dbtypes.Withdrawal, uint64, error) {
+	var sql strings.Builder
+	args := []any{}
+
+	fmt.Fprint(&sql, `
+	SELECT
+		block_uid, block_idx, type, orphaned, fork_id, validator, account_id, ref_slot, amount
+	FROM withdrawals`)
+	if canonicalOnly {
+		args = append(args, finalizedBlock)
+		fmt.Fprintf(&sql, " WHERE (block_uid >> 16 > $%v OR orphaned = false)", len(args))
+	}
+	args = append(args, limit)
+	fmt.Fprintf(&sql, " ORDER BY block_uid DESC NULLS LAST, block_idx ASC LIMIT $%v", len(args))
+	if offset > 0 {
+		args = append(args, offset)
+		fmt.Fprintf(&sql, " OFFSET $%v", len(args))
+	}
+
+	withdrawals := []*dbtypes.Withdrawal{}
+	if err := ReaderDb.SelectContext(ctx, &withdrawals, sql.String(), args...); err != nil {
+		return nil, 0, fmt.Errorf("error fetching recent withdrawals: %w", err)
+	}
+
+	var total uint64
+	countSql := EngineQuery(map[dbtypes.DBEngineType]string{
+		dbtypes.DBEnginePgsql:  `SELECT GREATEST(reltuples, 0)::bigint FROM pg_class WHERE relname = 'withdrawals'`,
+		dbtypes.DBEngineSqlite: `SELECT count(*) FROM withdrawals`,
+	})
+	if err := ReaderDb.GetContext(ctx, &total, countSql); err != nil {
+		return nil, 0, fmt.Errorf("error counting withdrawals: %w", err)
+	}
+	if canonicalOnly {
+		var orphaned uint64
+		if err := ReaderDb.GetContext(ctx, &orphaned, `SELECT count(*) FROM withdrawals WHERE orphaned = true`); err != nil {
+			return nil, 0, fmt.Errorf("error counting orphaned withdrawals: %w", err)
+		}
+		if orphaned < total {
+			total -= orphaned
+		}
+	}
+
+	return withdrawals, total, nil
+}
+
 func GetWithdrawalsFiltered(ctx context.Context, offset uint64, limit uint32, finalizedBlock uint64, filter *dbtypes.WithdrawalFilter) ([]*dbtypes.Withdrawal, uint64, error) {
+	if withdrawalsFilterIsRecentOnly(filter) {
+		return getRecentWithdrawals(ctx, offset, limit, finalizedBlock, filter.WithOrphaned == 0)
+	}
+
 	var sql strings.Builder
 	args := []any{}
 
